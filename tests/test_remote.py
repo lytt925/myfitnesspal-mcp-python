@@ -132,3 +132,37 @@ def test_allowed_hosts_enforced_when_configured(monkeypatch, host, status):
     auth = {**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
     with TestClient(app, base_url=f"http://{host}") as c:
         assert c.post("/mcp", json=INIT, headers=auth).status_code == status
+
+
+class _FakeContext:
+    """Stands in for a Playwright BrowserContext; cookies appear after N polls."""
+
+    def __init__(self, appears_after: int):
+        self.calls = 0
+        self.appears_after = appears_after
+
+    def cookies(self):
+        self.calls += 1
+        jar = [
+            {"name": "other", "value": "x", "domain": "example.com"},
+            {"name": "__Host-next-auth.csrf-token", "value": "c", "domain": "www.myfitnesspal.com"},
+        ]
+        if self.calls > self.appears_after:
+            jar.append({"name": "__Secure-next-auth.session-token", "value": "s",
+                        "domain": ".myfitnesspal.com"})
+        return jar
+
+
+def test_wait_for_login_returns_mfp_cookies_only():
+    ctx = _FakeContext(appears_after=2)
+    cookies = remote.wait_for_login(ctx, timeout=5, poll=0)
+    assert cookies == {
+        "__Host-next-auth.csrf-token": "c",
+        "__Secure-next-auth.session-token": "s",
+    }
+    assert ctx.calls == 3
+
+
+def test_wait_for_login_times_out_without_session():
+    with pytest.raises(RuntimeError, match="Timed out"):
+        remote.wait_for_login(_FakeContext(appears_after=10**9), timeout=0, poll=0)

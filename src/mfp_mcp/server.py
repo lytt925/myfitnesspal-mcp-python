@@ -230,7 +230,9 @@ _CHROMIUM_BROWSER_ALIASES: Dict[str, str] = {
 }
 
 
-def _safe_storage_keychain_password(service_name: str) -> Optional[bytes]:
+def _safe_storage_keychain_password(
+    service_name: str, timeout: float = 5
+) -> Optional[bytes]:
     """Look up `service_name` in the macOS Keychain and return the raw bytes.
 
     Returns None if the entry doesn't exist or access is denied.
@@ -247,7 +249,7 @@ def _safe_storage_keychain_password(service_name: str) -> Optional[bytes]:
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service_name, "-w"],
-            capture_output=True, check=True, timeout=5,
+            capture_output=True, check=True, timeout=timeout,
         )
         return result.stdout.strip()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
@@ -437,6 +439,7 @@ def _has_real_mfp_session(cookies: Dict[str, str]) -> bool:
 
 def _try_extract_from_chromium_browser(
     service: str,
+    keychain_timeout: float = 5,
 ) -> Optional[Dict[str, str]]:
     """Extract cookies from one specific Chromium browser by Safe Storage
     service name (e.g. 'Arc Safe Storage'). Returns None on any failure."""
@@ -453,7 +456,7 @@ def _try_extract_from_chromium_browser(
     if not db_path:
         logger.debug(f"No cookies DB found for '{browser_name}'")
         return None
-    password = _safe_storage_keychain_password(service)
+    password = _safe_storage_keychain_password(service, keychain_timeout)
     if not password:
         logger.debug(f"Keychain lookup failed for '{service}'")
         return None
@@ -466,6 +469,7 @@ def _try_extract_from_chromium_browser(
 
 
 def try_chromium_browsers_for_session_cookies(
+    keychain_timeout: float = 5,
 ) -> Optional[Tuple[str, Dict[str, str]]]:
     """Discover installed Chromium browsers (macOS only) and return the first
     one that has a valid MyFitnessPal session token.
@@ -480,7 +484,7 @@ def try_chromium_browsers_for_session_cookies(
         logger.debug("No Chromium Safe Storage entries found in keychain")
         return None
     for service in services:
-        cookies = _try_extract_from_chromium_browser(service)
+        cookies = _try_extract_from_chromium_browser(service, keychain_timeout)
         if not cookies:
             continue
         browser_name = service.replace(" Safe Storage", "").strip()

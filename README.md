@@ -557,16 +557,28 @@ Three things differ from the local setup:
 1. **Authentication to the server.** These tools can modify your diary, so HTTP mode refuses
    to start without `MFP_MCP_AUTH_TOKEN` (16+ chars). Clients send it as
    `Authorization: Bearer <token>`.
-2. **MyFitnessPal session.** A server has no browser to scrape. Export the session once from
-   a machine where you are logged into myfitnesspal.com and hand it to the server as
-   `MFP_COOKIES_JSON`:
+2. **MyFitnessPal session.** A server has no browser to scrape. Export the session once
+   from a computer and hand it to the server as `MFP_COOKIES_JSON`. The easiest way is to let
+   the tool open a browser window for you to log into; it detects the login, checks the
+   session against MyFitnessPal, and prints the JSON:
 
    ```bash
-   python -m mfp_mcp.server export-cookies            # --browser chrome|firefox|arc|... to pick one
+   pip install -e '.[login]'                    # adds Playwright
+   python -m mfp_mcp.server export-cookies --login
+   ```
+
+   It uses your installed Chrome, or run `playwright install chromium` if you have none.
+   Alternatively, if you are already logged in in a local browser, read it from there
+   (`--browser chrome|firefox|arc|...`; on macOS the default `auto` scans Chromium browsers
+   via the keychain):
+
+   ```bash
+   python -m mfp_mcp.server export-cookies
    ```
 
    Treat the output like a password. MFP sessions expire eventually; when tools start failing
-   with auth errors, re-run this and update the variable.
+   with auth errors, re-run this and update the variable. This step needs a computer; a phone
+   cannot run it.
 3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare
    Tunnel, ...). The bearer token travels in a header and must not go over plain HTTP.
 

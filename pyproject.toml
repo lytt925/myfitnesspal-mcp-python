@@ -51,6 +51,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `mfp-mcp export-cookies --login`: browser window to log in and capture the session
+login = [
+    "playwright>=1.40.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
