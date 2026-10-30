@@ -63,9 +63,18 @@ VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
 
 
 def ensure_config_dir():
-    """Ensure the config directory exists."""
+    """Ensure the config directory exists and, if it is ours, private.
+
+    A directory the operator pointed MFP_CONFIG_DIR at (a bind mount, say) is
+    only locked down when we create it, never chmod'ed after the fact.
+    """
+    created = not CONFIG_DIR.exists()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_DIR.chmod(0o700)
+    if created or not os.environ.get("MFP_CONFIG_DIR"):
+        try:
+            CONFIG_DIR.chmod(0o700)
+        except OSError as e:
+            logger.warning(f"Could not restrict {CONFIG_DIR} to the owner: {e}")
 
 
 def save_cookies(cookies: Dict[str, str]):
@@ -80,10 +89,20 @@ def save_cookies(cookies: Dict[str, str]):
         "cookies": cookies,
         "saved_at": datetime.now().isoformat(),
     }
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(cookie_data, f, indent=2)
-    # Session cookies grant full account access - restrict to owner only
-    COOKIES_FILE.chmod(0o600)
+    # Session cookies grant full account access. mkstemp creates the file
+    # owner-only (0600) from the start, and os.replace swaps it in atomically,
+    # so no reader sees a half-written or world-readable file.
+    fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".cookies-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cookie_data, f, indent=2)
+        os.replace(tmp_path, COOKIES_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
@@ -497,6 +516,10 @@ def try_chromium_browsers_for_session_cookies(
 # token is older than its update window, so regular use keeps the login alive.
 MFP_SESSION_URL = "https://www.myfitnesspal.com/api/auth/session"
 SESSION_REFRESH_INTERVAL = timedelta(hours=12)
+# Monotonic time of the last refresh attempt (None = never). Throttles even
+# when an attempt saved nothing, so a refresh that keeps coming back empty or
+# failing can't add a network round-trip to every tool call.
+_last_refresh_attempt: Optional[float] = None
 
 
 def _cookies_file_age() -> Optional[timedelta]:
@@ -548,14 +571,23 @@ def maybe_refresh_session(
 ) -> Dict[str, str]:
     """Keep a working MFP session alive by persisting MFP's re-issued cookies.
 
-    Throttled by cookies.json's age so it costs one extra request per
-    SESSION_REFRESH_INTERVAL, not one per tool call. Never raises: a failed
+    Throttled so it costs one extra request per SESSION_REFRESH_INTERVAL, not
+    one per tool call: by cookies.json's age (skipped when `force`) and by the
+    time of the last attempt, successful or not. Never raises: a failed
     refresh just leaves the current cookies in place.
     """
+    global _last_refresh_attempt
+    interval = SESSION_REFRESH_INTERVAL.total_seconds()
+    if (
+        _last_refresh_attempt is not None
+        and time.monotonic() - _last_refresh_attempt < interval
+    ):
+        return cookies
     if not force:
         age = _cookies_file_age()
         if age is not None and age < SESSION_REFRESH_INTERVAL:
             return cookies
+    _last_refresh_attempt = time.monotonic()
     try:
         updated = _fetch_refreshed_session(cookies)
         if not updated:
@@ -3182,4 +3214,9 @@ def main(argv: Optional[List[str]] = None):
 
 
 if __name__ == "__main__":
-    main()
+    # `python -m mfp_mcp.server` executes this file as __main__ while the package
+    # has already imported it as mfp_mcp.server; run the latter so there is one
+    # set of tools, settings and paths.
+    from mfp_mcp.server import main as _main
+
+    _main()

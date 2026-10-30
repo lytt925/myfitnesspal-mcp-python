@@ -76,8 +76,13 @@ class BearerAuthMiddleware:
         )
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            # Nothing here speaks websocket; refuse rather than skip the auth gate.
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
         if scope["path"] == HEALTH_PATH:
             await _respond(send, 200, b"ok")
@@ -109,6 +114,11 @@ async def _respond(
 
 # Keep the secret-bearing page out of caches and out of Referer headers.
 _PRIVATE_HEADERS = [(b"cache-control", b"no-store"), (b"referrer-policy", b"no-referrer")]
+_PAGE_HEADERS = _PRIVATE_HEADERS + [(
+    b"content-security-policy",
+    b"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    b"connect-src 'self'; base-uri 'none'; form-action 'none'",
+)]
 
 SESSION_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -181,7 +191,7 @@ async def save_pasted_session(scope, receive, send) -> None:
 
     if scope["method"] == "GET":
         await _respond(
-            send, 200, SESSION_PAGE.encode(), extra_headers=_PRIVATE_HEADERS,
+            send, 200, SESSION_PAGE.encode(), extra_headers=_PAGE_HEADERS,
             content_type=b"text/html; charset=utf-8",
         )
         return
@@ -215,7 +225,16 @@ async def save_pasted_session(scope, receive, send) -> None:
             "Log in again, copy fresh cookies, and retry. Nothing was saved.",
         )
         return
-    server.save_cookies(cookies)
+    try:
+        server.save_cookies(cookies)
+    except Exception as e:
+        logger.error(f"Could not save pasted session: {e}")
+        await _json_reply(
+            send, 500, False,
+            "The cookies are valid but could not be saved. Check that the server can "
+            "write to its config directory (MFP_CONFIG_DIR).",
+        )
+        return
     logger.info("Saved pasted MyFitnessPal session")
     await _json_reply(send, 200, True, f"Saved and verified ({len(cookies)} cookies). You're set.")
 
@@ -223,11 +242,19 @@ async def save_pasted_session(scope, receive, send) -> None:
 class _SessionRoutes:
     """Serve /session itself; everything else goes to the MCP app."""
 
-    def __init__(self, app):
+    def __init__(self, app, enabled: bool):
         self.app = app
+        self.enabled = enabled
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] == SESSION_PATH:
+        if scope["type"] == "http" and scope["path"].rstrip("/") == SESSION_PATH:
+            if not self.enabled:
+                # Without a token anyone (or any web page the owner visits) could
+                # POST cookies for their own account and hijack this server.
+                await _respond(
+                    send, 404, b"/session is disabled unless MFP_MCP_AUTH_TOKEN is set."
+                )
+                return
             await save_pasted_session(scope, receive, send)
         else:
             await self.app(scope, receive, send)
@@ -245,7 +272,9 @@ def build_http_app(token: Optional[str], stateless: bool = True):
     server.mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(hosts), allowed_hosts=hosts
     )
-    return BearerAuthMiddleware(_SessionRoutes(server.mcp.streamable_http_app()), token)
+    return BearerAuthMiddleware(
+        _SessionRoutes(server.mcp.streamable_http_app(), enabled=token is not None), token
+    )
 
 
 def _env_flag(name: str, default: bool) -> bool:

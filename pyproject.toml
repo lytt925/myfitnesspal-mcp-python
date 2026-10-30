@@ -43,6 +43,9 @@ dependencies = [
     "myfitnesspal>=2.0.0",
     "pydantic>=2.0.0",
     "uvicorn>=0.23.0",
+    # Imported directly; previously only arrived transitively via myfitnesspal.
+    "requests",
+    "cloudscraper",
     "browser-cookie3>=0.19.0",
     "pint>=0.22",
     "cryptography>=41.0.0",

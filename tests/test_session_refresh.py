@@ -41,6 +41,11 @@ def _http_date(delta):
     return format_datetime(datetime.now(timezone.utc) + delta, usegmt=True)
 
 
+@pytest.fixture(autouse=True)
+def _reset_attempt_throttle(monkeypatch):
+    monkeypatch.setattr(server, "_last_refresh_attempt", None)
+
+
 @pytest.fixture
 def cookie_file(tmp_path, monkeypatch):
     path = tmp_path / "cookies.json"
@@ -131,3 +136,65 @@ def test_network_failure_is_swallowed(cookie_file, monkeypatch):
 
     monkeypatch.setattr("requests.get", boom)
     assert server.maybe_refresh_session(OLD) == OLD
+
+
+def test_empty_result_does_not_retry_on_every_call(cookie_file, monkeypatch):
+    """A live session with no usable Set-Cookie saves nothing; don't re-ask each call."""
+    _write(cookie_file, datetime.now() - timedelta(days=2))
+    calls = _patch_get(monkeypatch, _Resp({"user": {}}, []))
+    for _ in range(3):
+        server.maybe_refresh_session(OLD)
+        server.maybe_refresh_session(OLD, force=True)
+    assert len(calls) == 1
+
+
+def test_failures_are_throttled_too(cookie_file, monkeypatch):
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise ConnectionError("down")
+
+    monkeypatch.setattr("requests.get", boom)
+    for _ in range(3):
+        server.maybe_refresh_session(OLD, force=True)
+    assert len(calls) == 1
+
+
+def test_attempt_allowed_again_after_the_interval(cookie_file, monkeypatch):
+    calls = _patch_get(monkeypatch, _Resp({"user": {}}, []))
+    server.maybe_refresh_session(OLD, force=True)
+    monkeypatch.setattr(server, "_last_refresh_attempt",
+                        server._last_refresh_attempt - 13 * 3600)
+    server.maybe_refresh_session(OLD, force=True)
+    assert len(calls) == 2
+
+
+def test_save_cookies_is_private_atomic_and_leaves_no_temp_files(cookie_file):
+    server.save_cookies(OLD)
+    assert (cookie_file.stat().st_mode & 0o777) == 0o600
+    assert json.loads(cookie_file.read_text())["cookies"] == OLD
+    assert [p.name for p in cookie_file.parent.iterdir()] == ["cookies.json"]
+
+
+def test_failed_save_keeps_old_file_and_cleans_up(cookie_file, monkeypatch):
+    server.save_cookies(OLD)
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(server.os, "replace", boom)
+    with pytest.raises(OSError):
+        server.save_cookies({"x": "y"})
+    assert json.loads(cookie_file.read_text())["cookies"] == OLD
+    assert [p.name for p in cookie_file.parent.iterdir()] == ["cookies.json"]
+
+
+def test_existing_custom_config_dir_is_not_chmodded(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    monkeypatch.setattr(server, "CONFIG_DIR", shared)
+    monkeypatch.setenv("MFP_CONFIG_DIR", str(shared))
+    server.ensure_config_dir()
+    assert (shared.stat().st_mode & 0o777) == 0o755

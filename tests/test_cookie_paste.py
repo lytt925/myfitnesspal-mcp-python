@@ -115,3 +115,57 @@ def test_mcp_endpoint_still_reachable(client):
                         "protocolVersion": "2025-03-26", "capabilities": {},
                         "clientInfo": {"name": "t", "version": "0"}}})
     assert r.status_code == 200
+
+
+def test_session_page_has_a_locked_down_csp(client):
+    csp = client.get(f"/session?token={TOKEN}").headers["content-security-policy"]
+    assert "default-src 'none'" in csp and "form-action 'none'" in csp
+
+
+def test_trailing_slash_is_the_same_endpoint(client):
+    assert client.get("/session/").status_code == 401
+    assert client.get(f"/session/?token={TOKEN}").status_code == 200
+
+
+def test_save_failure_is_reported_as_json_not_a_bare_500(client, stored, monkeypatch):
+    monkeypatch.setattr(remote, "verify_session", lambda c: None)
+
+    def boom(_):
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(server, "save_cookies", boom)
+    r = client.post("/session", content=GOOD, headers=AUTH)
+    assert r.status_code == 500 and r.json()["ok"] is False
+    assert "could not be saved" in r.json()["message"]
+
+
+def test_session_is_disabled_without_a_token(stored, monkeypatch):
+    """Tokenless mode must not expose a login-CSRF-able write endpoint."""
+    monkeypatch.setattr(remote, "verify_session", lambda c: pytest.fail("must not verify"))
+    server.mcp._session_manager = None
+    with TestClient(remote.build_http_app(None)) as c:
+        for method in ("get", "post"):
+            r = getattr(c, method)("/session", **({"content": GOOD} if method == "post" else {}))
+            assert r.status_code == 404
+        assert not stored.exists()
+        assert c.get("/healthz").status_code == 200
+
+
+def test_websocket_scopes_are_refused_not_passed_through():
+    import asyncio
+
+    reached = []
+
+    async def inner(scope, receive, send):
+        reached.append(scope["type"])
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    mw = remote.BearerAuthMiddleware(inner, TOKEN)
+    asyncio.run(mw({"type": "websocket", "path": "/mcp", "headers": []}, None, send))
+    assert reached == [] and sent == [{"type": "websocket.close", "code": 1008}]
+    asyncio.run(mw({"type": "lifespan"}, None, send))
+    assert reached == ["lifespan"]
