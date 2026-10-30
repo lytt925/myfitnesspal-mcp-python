@@ -2,16 +2,11 @@
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from mfp_mcp import server  # noqa: E402
+from mfp_mcp import server
 
 OLD = {"__Secure-next-auth.session-token": "old", "other": "keep"}
 
@@ -41,17 +36,10 @@ def _http_date(delta):
     return format_datetime(datetime.now(timezone.utc) + delta, usegmt=True)
 
 
-@pytest.fixture(autouse=True)
-def _reset_attempt_throttle(monkeypatch):
-    monkeypatch.setattr(server, "_last_refresh_attempt", None)
-
-
 @pytest.fixture
-def cookie_file(tmp_path, monkeypatch):
-    path = tmp_path / "cookies.json"
-    monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(server, "COOKIES_FILE", path)
-    return path
+def cookie_file(cookies_file):
+    cookies_file.parent.mkdir(parents=True, exist_ok=True)
+    return cookies_file
 
 
 def _write(path, saved_at):

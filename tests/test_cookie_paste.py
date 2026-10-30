@@ -2,16 +2,11 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
 import pytest
-from starlette.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from mfp_mcp import remote, server  # noqa: E402
-from mfp_mcp.cookie_paste import CookiePasteError, parse_pasted_cookies  # noqa: E402
+from mfp_mcp import remote, server
+from mfp_mcp.cookie_paste import CookiePasteError, parse_pasted_cookies
 
 TOKEN = "t" * 32
 SESSION = "__Secure-next-auth.session-token"
@@ -39,17 +34,13 @@ def test_rejects_unusable_input(text):
 
 
 @pytest.fixture
-def stored(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(server, "COOKIES_FILE", tmp_path / "cookies.json")
-    return tmp_path / "cookies.json"
+def stored(cookies_file):
+    return cookies_file
 
 
 @pytest.fixture
-def client():
-    server.mcp._session_manager = None
-    with TestClient(remote.build_http_app(TOKEN)) as c:
-        yield c
+def client(make_client):
+    return make_client(TOKEN)
 
 
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -139,16 +130,14 @@ def test_save_failure_is_reported_as_json_not_a_bare_500(client, stored, monkeyp
     assert "could not be saved" in r.json()["message"]
 
 
-def test_session_is_disabled_without_a_token(stored, monkeypatch):
+def test_session_is_disabled_without_a_token(stored, monkeypatch, make_client):
     """Tokenless mode must not expose a login-CSRF-able write endpoint."""
     monkeypatch.setattr(remote, "verify_session", lambda c: pytest.fail("must not verify"))
-    server.mcp._session_manager = None
-    with TestClient(remote.build_http_app(None)) as c:
-        for method in ("get", "post"):
-            r = getattr(c, method)("/session", **({"content": GOOD} if method == "post" else {}))
-            assert r.status_code == 404
-        assert not stored.exists()
-        assert c.get("/healthz").status_code == 200
+    c = make_client(token=None)
+    assert c.get("/session").status_code == 404
+    assert c.post("/session", content=GOOD).status_code == 404
+    assert not stored.exists()
+    assert c.get("/healthz").status_code == 200
 
 
 def test_websocket_scopes_are_refused_not_passed_through():

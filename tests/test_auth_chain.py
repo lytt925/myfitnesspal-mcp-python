@@ -2,25 +2,19 @@
 from __future__ import annotations
 
 import json
-import sys
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from mfp_mcp import server  # noqa: E402
+from mfp_mcp import server
 
 FILE = {"__Secure-next-auth.session-token": "from-file"}
 ENV = {"__Secure-next-auth.session-token": "from-env"}
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(server, "COOKIES_FILE", tmp_path / "cookies.json")
-    monkeypatch.delenv("MFP_COOKIES_JSON", raising=False)
+def env(cookies_file, monkeypatch):
+    cookies_file.parent.mkdir(parents=True, exist_ok=True)
     refreshed = []
     monkeypatch.setattr(
         server, "maybe_refresh_session",

@@ -5,15 +5,9 @@ No live MFP session or network needed; the app is driven in-process.
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
-
 import pytest
-from starlette.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from mfp_mcp import remote, server  # noqa: E402
+from mfp_mcp import remote, server
 
 TOKEN = "t" * 32
 MCP_HEADERS = {
@@ -32,12 +26,17 @@ INIT = {
 }
 
 
-@pytest.fixture(scope="module")
-def client():
-    server.mcp._session_manager = None  # a manager can only run() once per process
-    app = remote.build_http_app(TOKEN)
-    with TestClient(app) as c:
-        yield c
+@pytest.fixture
+def client(make_client):
+    return make_client(TOKEN)
+
+
+def rpc_result(response):
+    """The JSON-RPC message in a response, whether sent as SSE or plain JSON."""
+    if response.headers["content-type"].startswith("text/event-stream"):
+        data = [line[5:].strip() for line in response.text.splitlines() if line.startswith("data:")]
+        return json.loads(data[-1])
+    return response.json()
 
 
 def test_healthz_is_open(client):
@@ -81,10 +80,7 @@ def test_lists_tools(client):
         "/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers=auth
     )
     assert r.status_code == 200
-    payload = next(
-        json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")
-    ) if r.text.lstrip().startswith("event:") else r.json()
-    names = {t["name"] for t in payload["result"]["tools"]}
+    names = {t["name"] for t in rpc_result(r)["result"]["tools"]}
     assert "mfp_get_diary" in names
 
 
@@ -125,13 +121,11 @@ def test_load_env_cookies_unset(monkeypatch):
     ("mfp.example.com", 200),
     ("evil.example.net", 421),
 ])
-def test_allowed_hosts_enforced_when_configured(monkeypatch, host, status):
+def test_allowed_hosts_enforced_when_configured(monkeypatch, make_client, host, status):
     monkeypatch.setenv("MFP_MCP_ALLOWED_HOSTS", "mfp.example.com")
-    server.mcp._session_manager = None  # a manager can only run() once
-    app = remote.build_http_app(TOKEN)
+    c = make_client(TOKEN, base_url=f"http://{host}")
     auth = {**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
-    with TestClient(app, base_url=f"http://{host}") as c:
-        assert c.post("/mcp", json=INIT, headers=auth).status_code == status
+    assert c.post("/mcp", json=INIT, headers=auth).status_code == status
 
 
 class _FakeContext:
