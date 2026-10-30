@@ -484,9 +484,11 @@ def _parser() -> argparse.ArgumentParser:
         default=os.environ.get("MFP_MCP_TRANSPORT", "stdio"),
     )
     p.add_argument("--host", default=os.environ.get("MFP_MCP_HOST", "127.0.0.1"))
+    # A string default is run through `type=int` by argparse, so a bad PORT in the
+    # environment becomes a normal usage error instead of a traceback.
     p.add_argument(
         "--port", type=int,
-        default=int(os.environ.get("MFP_MCP_PORT") or os.environ.get("PORT") or 8000),
+        default=os.environ.get("MFP_MCP_PORT") or os.environ.get("PORT") or "8000",
     )
     sub = p.add_subparsers(dest="command")
     sub.add_parser(
