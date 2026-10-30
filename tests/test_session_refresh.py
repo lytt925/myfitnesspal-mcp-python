@@ -186,3 +186,173 @@ def test_existing_custom_config_dir_is_not_chmodded(tmp_path, monkeypatch):
     monkeypatch.setenv("MFP_CONFIG_DIR", str(shared))
     server.ensure_config_dir()
     assert (shared.stat().st_mode & 0o777) == 0o755
+
+
+# --------------------------------------------------------------------------
+# Robustness: odd Set-Cookie headers, error responses, concurrency
+# --------------------------------------------------------------------------
+import threading  # noqa: E402
+
+# Shape of a NextAuth session token: a JWE with an empty key segment ("dir" alg).
+JWE = ("eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..2QUbnKDy1qlYpdDf."
+       "JCNygnrd5QT7WLFmt76-tIWgd6cclPOHKi9h6OghWRgvCT1Niev9FgBKHNL8Kq_yMg.wG9U_AP1-zxGeSA1RYnX7g==")
+
+
+def fetch_with(monkeypatch, *set_cookies, body=None):
+    _patch_get(monkeypatch, _Resp({"user": {}} if body is None else body, set_cookies))
+    return server._fetch_refreshed_session(OLD)
+
+
+def test_realistic_session_token_survives_verbatim(monkeypatch):
+    header = f"__Secure-next-auth.session-token={JWE}; Path=/; Expires={_http_date(timedelta(days=30))}; HttpOnly; Secure; SameSite=Lax"
+    assert fetch_with(monkeypatch, header) == {"__Secure-next-auth.session-token": JWE}
+
+
+@pytest.mark.parametrize("value", ["a=b==", "x.y-z_w", "%7B%22a%22%3A1%7D", "A" * 4000])
+def test_values_with_padding_percent_escapes_and_length_survive(monkeypatch, value):
+    assert fetch_with(monkeypatch, f"c={value}; Path=/") == {"c": value}
+
+
+def test_the_last_of_two_set_cookies_for_one_name_wins(monkeypatch):
+    got = fetch_with(monkeypatch, "c=first; Path=/", "c=second; Path=/")
+    assert got == {"c": "second"}
+
+
+def test_cookies_not_mentioned_by_the_response_are_left_alone(cookie_file, monkeypatch):
+    _write(cookie_file, datetime.now() - timedelta(days=2))
+    _patch_get(monkeypatch, _Resp({"user": {}}, ["brand-new=1; Path=/"]))
+    merged = server.maybe_refresh_session(OLD)
+    assert merged == {**OLD, "brand-new": "1"}
+
+
+@pytest.mark.parametrize("attr", ["Max-Age=0", "Max-Age=-1", "expires=Thu, 01 Jan 1970 00:00:00 GMT"])
+def test_cookies_being_deleted_are_never_stored(monkeypatch, attr):
+    assert fetch_with(monkeypatch, f"gone=still-has-a-value; Path=/; {attr}") == {}
+
+
+def test_positive_max_age_is_kept(monkeypatch):
+    assert fetch_with(monkeypatch, "kept=1; Path=/; Max-Age=2592000") == {"kept": "1"}
+
+
+@pytest.mark.parametrize("expires", ["Expires=not a date", "Expires=", "Expires=Sun, 99 Foo 2026 25:61:61 GMT"])
+def test_an_unparseable_expiry_does_not_discard_the_cookie(monkeypatch, expires):
+    assert fetch_with(monkeypatch, f"c=1; Path=/; {expires}") == {"c": "1"}
+
+
+def test_a_timezone_less_expiry_date_is_handled(monkeypatch):
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%a, %d %b %Y %H:%M:%S -0000")
+    assert fetch_with(monkeypatch, f"c=1; Path=/; Expires={future}") == {"c": "1"}
+
+
+def test_an_empty_header_list_is_not_a_failure(monkeypatch):
+    assert fetch_with(monkeypatch) == {}
+
+
+class _Failing(_Resp):
+    def __init__(self, status=200, body_error=None):
+        super().__init__({})
+        self.status, self.body_error = status, body_error
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    def json(self):
+        if self.body_error:
+            raise self.body_error
+        return {}
+
+
+@pytest.mark.parametrize("resp", [
+    _Failing(403), _Failing(500), _Failing(429),
+    _Failing(200, body_error=ValueError("<html>Just a moment...</html>")),  # Cloudflare challenge page
+])
+def test_error_responses_never_touch_the_stored_session(cookie_file, monkeypatch, resp):
+    _write(cookie_file, datetime.now() - timedelta(days=2))
+    before = cookie_file.read_text()
+    _patch_get(monkeypatch, resp)
+    assert server.maybe_refresh_session(OLD) == OLD
+    assert cookie_file.read_text() == before
+
+
+def test_request_goes_to_the_session_endpoint_with_a_timeout(monkeypatch):
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen.update(url=url, **kw)
+        return _Resp({"user": {}}, [])
+
+    monkeypatch.setattr("requests.get", fake_get)
+    server._fetch_refreshed_session(OLD)
+    assert seen["url"] == "https://www.myfitnesspal.com/api/auth/session"
+    assert seen["cookies"] == OLD and 0 < seen["timeout"] <= 30  # never hangs a tool call
+
+
+def test_the_log_never_contains_cookie_values(cookie_file, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="mfp_mcp")
+    _write(cookie_file, datetime.now() - timedelta(days=2))
+    header = f"__Secure-next-auth.session-token={JWE}; Path=/; Expires={_http_date(timedelta(days=30))}"
+    _patch_get(monkeypatch, _Resp({"user": {}}, [header]))
+    server.maybe_refresh_session(OLD)
+    assert "re-issued" in caplog.text
+    assert JWE not in caplog.text
+
+
+def test_readers_never_see_a_partial_file_while_writers_race(cookie_file):
+    """Atomic replace: a concurrent load_cookies() is always complete JSON or the previous one."""
+    cookie_file.parent.mkdir(parents=True, exist_ok=True)
+    server.save_cookies({"gen": "0", "pad": "x" * 50_000})
+    stop = threading.Event()
+    seen_bad = []
+
+    def reader():
+        while not stop.is_set():
+            got = server.load_cookies()
+            if got is None or "gen" not in got or len(got["pad"]) != 50_000:
+                seen_bad.append(got and list(got))
+
+    def writer(n):
+        for i in range(60):
+            server.save_cookies({"gen": f"{n}-{i}", "pad": "x" * 50_000})
+
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    writers = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for t in readers + writers:
+        t.start()
+    for t in writers:
+        t.join()
+    stop.set()
+    for t in readers:
+        t.join()
+    assert seen_bad == []
+    assert [p.name for p in cookie_file.parent.iterdir()] == ["cookies.json"]  # no temp litter
+
+
+def test_stale_stored_session_is_refreshed_on_the_way_through_get_mfp_client(cookie_file, monkeypatch):
+    """End to end: stored cookies work -> they are re-issued -> the file holds the new token."""
+    _write(cookie_file, datetime.now() - timedelta(days=2))
+    monkeypatch.setattr(server, "_client_from_cookies", lambda cookies: ("client", dict(cookies)))
+    _patch_get(monkeypatch, _Resp({"user": {}}, ["__Secure-next-auth.session-token=reissued; Path=/"]))
+    assert server.get_mfp_client()[0] == "client"
+    saved = json.loads(cookie_file.read_text())["cookies"]
+    assert saved["__Secure-next-auth.session-token"] == "reissued" and saved["other"] == "keep"
+
+
+@pytest.mark.parametrize("header,expected", [
+    ("a=1; Path=/; HttpOnly", ("a", "1", {"path": "/", "httponly": ""})),
+    ("  a = 1 ;Path=/", ("a", "1", {"path": "/"})),
+    ('a="quoted"; Secure', ("a", "quoted", {"secure": ""})),
+    ("a=b=c==; SameSite=Lax", ("a", "b=c==", {"samesite": "Lax"})),
+    ("a=; Max-Age=0", ("a", "", {"max-age": "0"})),
+    ("a=1; Expires=Sun, 29 Nov 2026 14:24:22 GMT", ("a", "1", {"expires": "Sun, 29 Nov 2026 14:24:22 GMT"})),
+    ("a=1; EXPIRES=whenever; MAX-AGE=5", ("a", "1", {"expires": "whenever", "max-age": "5"})),
+])
+def test_set_cookie_parsing(header, expected):
+    assert server._parse_set_cookie(header) == expected
+
+
+@pytest.mark.parametrize("header", ["", "no-equals-sign", "=value", "  =  ; Path=/", ";"])
+def test_malformed_set_cookie_headers_are_ignored(header):
+    assert server._parse_set_cookie(header) is None
