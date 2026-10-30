@@ -382,15 +382,28 @@ def export_cookies(browser: str) -> None:
     print(json.dumps(cookies, separators=(",", ":")))
 
 
-def import_cookies() -> None:
-    """Read pasted DevTools cookies (or export-cookies JSON) from stdin and save them."""
+def _read_cookie_input(path: Optional[str]) -> str:
+    """The pasted cookies: from FILE, or from a pipe on stdin.
+
+    Typing them into an interactive terminal is refused: a terminal line holds at
+    most 1024 characters on macOS, and the session cookie alone is ~1600, so the
+    paste would hang forever waiting for an end of input that never arrives.
+    """
+    if path:
+        with open(path, encoding="utf-8-sig") as f:
+            return f.read()
     if sys.stdin.isatty():
-        print(
-            "Paste the Cookie header (or JSON / DevTools rows), then press Ctrl-D:",
-            file=sys.stderr,
+        raise RuntimeError(
+            "Give a file: import-cookies cookies.txt (a terminal cannot take a line "
+            "this long). Or pipe it in, e.g. pbpaste | import-cookies"
         )
+    return sys.stdin.read()
+
+
+def import_cookies(path: Optional[str] = None) -> None:
+    """Read cookies pasted from DevTools (or export-cookies JSON), verify and save them."""
     try:
-        cookies = parse_pasted_cookies(sys.stdin.read())
+        cookies = parse_pasted_cookies(_read_cookie_input(path))
         from mfp_mcp import server
 
         if not server._has_real_mfp_session(cookies):
@@ -429,9 +442,9 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
     sub.add_parser(
         "import-cookies",
-        help="read cookies pasted from browser DevTools (or export-cookies output) "
-             "on stdin, check them, and save them for the server",
-    )
+        help="read cookies copied from browser DevTools (or export-cookies output) "
+             "from FILE or a pipe, check them, and save them for the server",
+    ).add_argument("file", nargs="?", help="text file holding the copied cookies")
     ec = sub.add_parser(
         "export-cookies",
         help="print MFP_COOKIES_JSON from a local browser session, for a headless server",
@@ -443,7 +456,7 @@ def _parser() -> argparse.ArgumentParser:
 def run_cli(argv: Optional[List[str]] = None) -> None:
     args = _parser().parse_args(argv)
     if args.command == "import-cookies":
-        import_cookies()
+        import_cookies(args.file)
     elif args.command == "export-cookies":
         export_cookies(args.browser)
     elif args.transport == "streamable-http":

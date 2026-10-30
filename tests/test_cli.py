@@ -70,7 +70,7 @@ def test_run_cli_dispatches(monkeypatch):
     calls = []
     monkeypatch.setattr(remote, "serve_http", lambda h, p: calls.append(("http", h, p)))
     monkeypatch.setattr(remote, "export_cookies", lambda b: calls.append(("export", b)))
-    monkeypatch.setattr(remote, "import_cookies", lambda: calls.append(("import",)))
+    monkeypatch.setattr(remote, "import_cookies", lambda f=None: calls.append(("import", f)))
     monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append(("stdio",)))
 
     remote.run_cli([])
@@ -78,8 +78,9 @@ def test_run_cli_dispatches(monkeypatch):
     remote.run_cli(["export-cookies", "--browser", "arc"])
     remote.run_cli(["export-cookies"])
     remote.run_cli(["import-cookies"])
+    remote.run_cli(["import-cookies", "c.txt"])
     assert calls == [("stdio",), ("http", "0.0.0.0", 1234), ("export", "arc"),
-                     ("export", "auto"), ("import",)]
+                     ("export", "auto"), ("import", None), ("import", "c.txt")]
 
 
 def test_main_is_wired_to_the_cli(monkeypatch):
@@ -182,11 +183,16 @@ def test_export_reports_collection_failures(monkeypatch, capsys):
     assert out == "" and "No MyFitnessPal session found" in code
 
 
-def run_import(monkeypatch, capsys, pasted, verify=None):
-    monkeypatch.setattr(sys, "stdin", io.StringIO(pasted))
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def run_import(monkeypatch, capsys, pasted, verify=None, path=None, tty=False):
+    monkeypatch.setattr(sys, "stdin", (_Terminal if tty else io.StringIO)(pasted))
     monkeypatch.setattr(remote, "verify_session", verify or (lambda c: None))
     try:
-        remote.import_cookies()
+        remote.import_cookies(path)
         code = None
     except SystemExit as e:
         code = str(e.code)
@@ -199,6 +205,33 @@ def test_import_saves_a_paste_and_prints_nothing_secret(monkeypatch, capsys):
     assert code is None
     assert server.load_cookies() == COOKIES
     assert SECRET not in out and SECRET not in err and "saved to" in err
+
+
+def test_import_reads_a_file(monkeypatch, capsys, tmp_path):
+    f = tmp_path / "cookies.txt"
+    f.write_text(f"{SESSION}={SECRET}\n_ga=GA1.2\n")
+    code, out, err = run_import(monkeypatch, capsys, "", path=str(f))
+    assert code is None and server.load_cookies() == COOKIES
+    assert SECRET not in out + err
+
+
+def test_import_file_with_a_bom_and_a_long_session_cookie(monkeypatch, capsys, tmp_path):
+    f = tmp_path / "cookies.txt"
+    f.write_text(f"\ufeff{SESSION}={'e' * 1700}; _ga=GA1.2", encoding="utf-8")
+    code, _, _ = run_import(monkeypatch, capsys, "", path=str(f))
+    assert code is None and len(server.load_cookies()[SESSION]) == 1700
+
+
+def test_import_missing_file_is_a_clear_error(monkeypatch, capsys, tmp_path):
+    code, out, _ = run_import(monkeypatch, capsys, "", path=str(tmp_path / "nope.txt"))
+    assert out == "" and "import-cookies failed" in code and "nope.txt" in code
+    assert server.load_cookies() is None
+
+
+def test_import_on_a_terminal_points_to_a_file_instead_of_hanging(monkeypatch, capsys):
+    code, out, _ = run_import(monkeypatch, capsys, "ignored", tty=True)
+    assert out == "" and "import-cookies failed" in code and "file" in code
+    assert server.load_cookies() is None
 
 
 def test_import_accepts_export_cookies_output(monkeypatch, capsys):

@@ -42,23 +42,22 @@ macOS asks for access to the browser's keychain entry: type your Mac password on
 dialog, and click **Allow** (not Always Allow) within 2 minutes. `--browser` also takes
 `firefox`, `arc`, `edge`, `brave`, ...
 
-**Option B: paste from DevTools (any OS)**. Log in, press F12 → Application (Firefox: Storage) →
-Cookies → `https://www.myfitnesspal.com`, and copy the *Value* of those two cookies. Then:
+**Option B: copy from DevTools into a file (any OS)**. Log in, press F12 → Network, reload, click
+any request to `www.myfitnesspal.com`, and copy the whole `cookie:` line from *Request Headers*.
+Paste it into a plain-text file (say `cookies.txt`), then:
 
 ```bash
-uv run python -m mfp_mcp.server import-cookies
+uv run python -m mfp_mcp.server import-cookies cookies.txt
+rm cookies.txt        # it holds your login; don't leave it around
 ```
 
-Paste, then press Ctrl-D:
+Don't paste into the terminal itself: a terminal line is limited to 1024 characters and the login
+cookie alone is longer, so the command would just hang. A pipe works too: `pbpaste | uv run python -m
+mfp_mcp.server import-cookies` on macOS.
 
-```
-__Secure-next-auth.session-token=eyJ...
-_mfp_session=...
-```
-
-The whole `Cookie` request header (Network tab), JSON, and "Copy as cURL" are accepted too. Don't
-use `document.cookie`: the login cookie is HttpOnly and won't be there. Paste into the terminal,
-never into a chat or an issue.
+The file can hold the `cookie:` line, `name=value` lines (the two cookies above are the ones that
+matter), JSON, or a "Copy as cURL" command. Don't use `document.cookie`: the login cookie is
+HttpOnly and won't be there. Never paste cookies into a chat or an issue.
 
 Either way the session is saved to `~/.mfp_mcp/cookies.json`, which is where the server reads it.
 
