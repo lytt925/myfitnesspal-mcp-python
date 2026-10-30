@@ -158,3 +158,129 @@ def test_websocket_scopes_are_refused_not_passed_through():
     assert reached == [] and sent == [{"type": "websocket.close", "code": 1008}]
     asyncio.run(mw({"type": "lifespan"}, None, send))
     assert reached == ["lifespan"]
+
+
+# --------------------------------------------------------------------------
+# Robustness: generated round trips and messy real-world pastes
+# --------------------------------------------------------------------------
+import random  # noqa: E402
+import string  # noqa: E402
+
+_NAME_CHARS = string.ascii_letters + string.digits + "-_."
+_VALUE_CHARS = string.ascii_letters + string.digits + "-_.=+/%~"  # JWT/base64/url-ish
+
+
+def _random_cookies(rng, n):
+    names = set()
+    while len(names) < n:
+        names.add("".join(rng.choices(_NAME_CHARS, k=rng.randint(1, 24))))
+    return {
+        name: "".join(rng.choices(_VALUE_CHARS, k=rng.randint(1, 900)))
+        for name in sorted(names)
+    }
+
+
+def _render(cookies, fmt):
+    if fmt == "header":
+        return "; ".join(f"{k}={v}" for k, v in cookies.items())
+    if fmt == "header-prefixed":
+        return "Cookie: " + "; ".join(f"{k}={v}" for k, v in cookies.items())
+    if fmt == "header-lines":
+        return "\n".join(f"{k}={v};" for k, v in cookies.items())
+    if fmt == "json-object":
+        return json.dumps(cookies)
+    if fmt == "json-wrapped":
+        return json.dumps({"cookies": cookies, "saved_at": "2026-01-01"})
+    if fmt == "json-array":
+        return json.dumps([{"name": k, "value": v, "domain": ".x", "httpOnly": True}
+                           for k, v in cookies.items()])
+    if fmt == "devtools-table":
+        return "\n".join(f"{k}\t{v}\twww.myfitnesspal.com\t/\t2026-11-29T14:24:22.000Z\t512\t✓\t✓"
+                         for k, v in cookies.items())
+    raise AssertionError(fmt)
+
+
+FORMATS = ["header", "header-prefixed", "header-lines", "json-object",
+           "json-wrapped", "json-array", "devtools-table"]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("seed", range(25))
+def test_generated_cookies_round_trip_in_every_format(fmt, seed):
+    rng = random.Random(f"{fmt}-{seed}")
+    cookies = _random_cookies(rng, rng.randint(1, 40))
+    assert parse_pasted_cookies(_render(cookies, fmt)) == cookies
+
+
+@pytest.mark.parametrize("fmt", ["header", "devtools-table", "header-lines"])
+def test_windows_line_endings_and_surrounding_whitespace(fmt):
+    cookies = {"a": "1", "b": "x=y"}
+    pasted = "\r\n\r\n   " + _render(cookies, fmt).replace("\n", "\r\n") + "  \r\n\r\n"
+    assert parse_pasted_cookies(pasted) == cookies
+
+
+def test_pasting_a_whole_request_headers_block_extracts_only_the_cookie_line():
+    block = (
+        "GET /api/auth/session HTTP/2\n"
+        "accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\n"
+        "accept-language: en-US,en;q=0.9\n"
+        "cookie: __Secure-next-auth.session-token=abc; _ga=GA1.2\n"
+        "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\n"
+    )
+    assert parse_pasted_cookies(block) == {"__Secure-next-auth.session-token": "abc", "_ga": "GA1.2"}
+
+
+@pytest.mark.parametrize("curl", [
+    "curl 'https://www.myfitnesspal.com/api/auth/session' -H 'accept: */*' "
+    "-b '__Secure-next-auth.session-token=abc; _ga=GA1.2' -H 'user-agent: x'",
+    "curl 'https://www.myfitnesspal.com/' -H 'cookie: __Secure-next-auth.session-token=abc; _ga=GA1.2'",
+    'curl "https://www.myfitnesspal.com/" --cookie "__Secure-next-auth.session-token=abc; _ga=GA1.2"',
+])
+def test_copy_as_curl_is_understood(curl):
+    assert parse_pasted_cookies(curl) == {"__Secure-next-auth.session-token": "abc", "_ga": "GA1.2"}
+
+
+def test_json_values_that_are_not_strings():
+    pasted = json.dumps({"a": "1", "n": 5, "t": True, "nothing": None, "nested": {"x": 1}, "l": [1]})
+    assert parse_pasted_cookies(pasted) == {"a": "1", "n": "5", "t": "True"}
+
+
+def test_json_array_entries_missing_fields_are_skipped():
+    pasted = json.dumps([{"name": "a", "value": "1"}, {"name": "no-value"}, {"value": "no-name"}, {}])
+    assert parse_pasted_cookies(pasted) == {"a": "1"}
+
+
+def test_quoted_values_lose_their_quotes_and_later_duplicates_win():
+    assert parse_pasted_cookies('a="1"; b=2; a=3') == {"a": "3", "b": "2"}
+
+
+def test_byte_order_mark_and_non_breaking_spaces_are_tolerated():
+    assert parse_pasted_cookies("﻿a=1; b=2") == {"a": "1", "b": "2"}
+
+
+def test_too_many_cookies_is_rejected_not_truncated():
+    pasted = "; ".join(f"c{i}=v" for i in range(201))
+    with pytest.raises(CookiePasteError, match="Too many"):
+        parse_pasted_cookies(pasted)
+
+
+@pytest.mark.parametrize("junk", [
+    "\x00\x01\x02", "💥" * 50, "=" * 100, ";;;;;;", "a" * 100_000, "{" * 1000, "\t\t\t",
+])
+def test_junk_never_raises_anything_but_cookiepasteerror(junk):
+    try:
+        result = parse_pasted_cookies(junk)
+    except CookiePasteError:
+        return
+    assert isinstance(result, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in result.items())
+
+
+def test_random_garbage_fuzz_never_crashes():
+    rng = random.Random(1234)
+    alphabet = string.printable + "雙💥 ﻿"
+    for _ in range(500):
+        text = "".join(rng.choices(alphabet, k=rng.randint(0, 300)))
+        try:
+            parse_pasted_cookies(text)
+        except CookiePasteError:
+            pass
