@@ -504,7 +504,8 @@ myfitnesspal-mcp-python/
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
-        ├── remote.py       # HTTP transport, bearer auth, export-cookies CLI
+        ├── cookie_paste.py # Parse cookies pasted from DevTools
+        ├── remote.py       # HTTP transport, bearer auth, /session, cookie CLIs
         └── server.py       # MCP server implementation
 ```
 
@@ -576,7 +577,19 @@ Three things differ from the local setup:
    python -m mfp_mcp.server export-cookies
    ```
 
-   Treat the output like a password. This step needs a computer; a phone cannot run it.
+   Treat the output like a password. This step needs a computer.
+
+   **Or paste cookies from DevTools (works from any device, no install).** Log into
+   myfitnesspal.com, press F12 → Network, reload, click any request to `www.myfitnesspal.com`,
+   and copy the whole `Cookie` request header. Then either:
+
+   - open `https://<your-server>/session?token=<MFP_MCP_AUTH_TOKEN>` and paste into the form, or
+   - `curl -X POST https://<your-server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`, or
+   - locally: `python -m mfp_mcp.server import-cookies` (paste, then Ctrl-D) to print `MFP_COOKIES_JSON`.
+
+   The paste is checked against MyFitnessPal first and only saved if it works; values are never
+   echoed back. Cookie header, JSON, and rows copied from Application → Cookies are all accepted.
+   Don't use `document.cookie`: the login cookie is HttpOnly and it won't be there.
 
    **You only do this once.** MFP's login lasts about 30 days, but the server keeps it alive
    by itself: while it is in use, it asks MFP to re-issue the session cookie (at most once per

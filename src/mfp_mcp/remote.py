@@ -25,6 +25,7 @@ Configuration (flags override environment):
 """
 
 import argparse
+import asyncio
 import hmac
 import json
 import logging
@@ -36,10 +37,14 @@ from urllib.parse import parse_qs
 
 from mcp.server.transport_security import TransportSecuritySettings
 
+from mfp_mcp.cookie_paste import CookiePasteError, parse_pasted_cookies
+
 logger = logging.getLogger("mfp_mcp")
 
 MIN_TOKEN_LENGTH = 16
 HEALTH_PATH = "/healthz"
+SESSION_PATH = "/session"
+MAX_PASTE_BYTES = 64 * 1024
 # Tools that only make sense next to a local browser.
 LOCAL_ONLY_TOOLS = ("refresh_browser_cookies",)
 
@@ -88,17 +93,146 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-async def _respond(send, status: int, body: bytes, extra_headers=()):
+async def _respond(
+    send, status: int, body: bytes, extra_headers=(),
+    content_type: bytes = b"text/plain; charset=utf-8",
+):
     await send({
         "type": "http.response.start",
         "status": status,
         "headers": [
-            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-type", content_type),
             (b"content-length", str(len(body)).encode()),
             *extra_headers,
         ],
     })
     await send({"type": "http.response.body", "body": body})
+
+
+# Keep the secret-bearing page out of caches and out of Referer headers.
+_PRIVATE_HEADERS = [(b"cache-control", b"no-store"), (b"referrer-policy", b"no-referrer")]
+
+SESSION_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MyFitnessPal session</title>
+<style>
+ body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:0 auto;padding:1rem}
+ textarea{width:100%;height:11rem;font:13px monospace;box-sizing:border-box}
+ button{font-size:1rem;padding:.5rem 1.2rem;margin-top:.5rem}
+ #out{margin-top:1rem;white-space:pre-wrap}.ok{color:#1a7f37}.err{color:#cf222e}
+</style></head><body>
+<h1>MyFitnessPal session</h1>
+<p>Paste your logged-in MyFitnessPal cookies. They are checked against
+MyFitnessPal before being saved, and are never shown again.</p>
+<ol>
+ <li>Open <b>myfitnesspal.com</b> logged in, press <b>F12</b> &rarr; <b>Network</b>, reload.</li>
+ <li>Click any request to <code>www.myfitnesspal.com</code> &rarr; <b>Request Headers</b> &rarr;
+     copy the whole <code>Cookie</code> value.</li>
+ <li>Paste it below. (Application &rarr; Cookies rows and JSON also work.
+     <code>document.cookie</code> will <b>not</b>: the login cookie is HttpOnly.)</li>
+</ol>
+<textarea id="t" autocomplete="off" spellcheck="false"></textarea><br>
+<button id="b">Save session</button>
+<div id="out"></div>
+<script>
+const q = new URLSearchParams(location.search), token = q.get("token") || "";
+if (token) history.replaceState(null, "", location.pathname);
+document.getElementById("b").onclick = async () => {
+  const out = document.getElementById("out");
+  out.className = ""; out.textContent = "Checking with MyFitnessPal...";
+  try {
+    const r = await fetch(location.pathname, {method: "POST",
+      headers: token ? {Authorization: "Bearer " + token} : {},
+      body: document.getElementById("t").value});
+    const j = await r.json();
+    out.className = j.ok ? "ok" : "err"; out.textContent = j.message;
+    if (j.ok) document.getElementById("t").value = "";
+  } catch (e) { out.className = "err"; out.textContent = "Request failed: " + e; }
+};
+</script></body></html>
+"""
+
+
+async def _read_body(receive, limit: int) -> Optional[bytes]:
+    """Read a request body; None if it exceeds `limit`."""
+    chunks, size = [], 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return None
+        chunk = message.get("body", b"")
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+        if not message.get("more_body"):
+            return b"".join(chunks)
+
+
+async def _json_reply(send, status: int, ok: bool, message: str):
+    await _respond(
+        send, status, json.dumps({"ok": ok, "message": message}).encode(),
+        extra_headers=_PRIVATE_HEADERS, content_type=b"application/json",
+    )
+
+
+async def save_pasted_session(scope, receive, send) -> None:
+    """GET: the paste form. POST: verify pasted cookies, then store them."""
+    from mfp_mcp import server
+
+    if scope["method"] == "GET":
+        await _respond(
+            send, 200, SESSION_PAGE.encode(), extra_headers=_PRIVATE_HEADERS,
+            content_type=b"text/html; charset=utf-8",
+        )
+        return
+    if scope["method"] != "POST":
+        await _respond(send, 405, b"Method Not Allowed", extra_headers=[(b"allow", b"GET, POST")])
+        return
+
+    body = await _read_body(receive, MAX_PASTE_BYTES)
+    if body is None:
+        await _json_reply(send, 413, False, "Paste is too large.")
+        return
+    try:
+        cookies = parse_pasted_cookies(body.decode("utf-8", errors="replace"))
+    except CookiePasteError as e:
+        await _json_reply(send, 400, False, str(e))
+        return
+    if not server._has_real_mfp_session(cookies):
+        await _json_reply(
+            send, 400, False,
+            "No login cookie (…session-token) found. It is HttpOnly, so copy it from the "
+            "Network tab's Cookie request header or the Application tab, not document.cookie.",
+        )
+        return
+    try:
+        await asyncio.to_thread(verify_session, cookies)
+    except Exception as e:
+        logger.warning(f"Pasted session rejected by MyFitnessPal: {type(e).__name__}")
+        await _json_reply(
+            send, 400, False,
+            "MyFitnessPal rejected these cookies (expired or logged out?). "
+            "Log in again, copy fresh cookies, and retry. Nothing was saved.",
+        )
+        return
+    server.save_cookies(cookies)
+    logger.info("Saved pasted MyFitnessPal session")
+    await _json_reply(send, 200, True, f"Saved and verified ({len(cookies)} cookies). You're set.")
+
+
+class _SessionRoutes:
+    """Serve /session itself; everything else goes to the MCP app."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == SESSION_PATH:
+            await save_pasted_session(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
 
 
 def build_http_app(token: Optional[str], stateless: bool = True):
@@ -118,7 +252,7 @@ def build_http_app(token: Optional[str], stateless: bool = True):
     server.mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(hosts), allowed_hosts=hosts
     )
-    return BearerAuthMiddleware(server.mcp.streamable_http_app(), token)
+    return BearerAuthMiddleware(_SessionRoutes(server.mcp.streamable_http_app()), token)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -293,6 +427,29 @@ def export_cookies(browser: str, login: bool = False, timeout: float = 300) -> N
     print(json.dumps(cookies, separators=(",", ":")))
 
 
+def import_cookies() -> None:
+    """Read pasted DevTools cookies from stdin and print MFP_COOKIES_JSON."""
+    if sys.stdin.isatty():
+        print(
+            "Paste the Cookie header (or JSON / DevTools rows), then press Ctrl-D:",
+            file=sys.stderr,
+        )
+    try:
+        cookies = parse_pasted_cookies(sys.stdin.read())
+        from mfp_mcp import server
+
+        if not server._has_real_mfp_session(cookies):
+            raise RuntimeError(
+                "No login cookie (...session-token) in the paste. It is HttpOnly: copy "
+                "the Cookie request header from the Network tab, not document.cookie."
+            )
+        verify_session(cookies)
+    except Exception as e:
+        sys.exit(f"import-cookies failed: {e}")
+    print("Session verified against MyFitnessPal.", file=sys.stderr)
+    print(json.dumps(cookies, separators=(",", ":")))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -310,6 +467,10 @@ def _parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("MFP_MCP_PORT") or os.environ.get("PORT") or 8000),
     )
     sub = p.add_subparsers(dest="command")
+    sub.add_parser(
+        "import-cookies",
+        help="read cookies pasted from browser DevTools on stdin; print MFP_COOKIES_JSON",
+    )
     ec = sub.add_parser(
         "export-cookies",
         help="print MFP_COOKIES_JSON from a local browser session, for a headless server",
@@ -327,7 +488,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def run_cli(argv: Optional[List[str]] = None) -> None:
     args = _parser().parse_args(argv)
-    if args.command == "export-cookies":
+    if args.command == "import-cookies":
+        import_cookies()
+    elif args.command == "export-cookies":
         export_cookies(args.browser, args.login, args.timeout)
     elif args.transport == "streamable-http":
         serve_http(args.host, args.port)

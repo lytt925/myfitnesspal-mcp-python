@@ -34,6 +34,7 @@ INIT = {
 
 @pytest.fixture(scope="module")
 def client():
+    server.mcp._session_manager = None  # a manager can only run() once per process
     app = remote.build_http_app(TOKEN)
     with TestClient(app) as c:
         yield c
