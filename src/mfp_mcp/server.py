@@ -12,6 +12,10 @@ Authentication Methods (in order of priority):
    Opera, and any other installed Chromium browser detected via the keychain
    "Safe Storage" entry.
 4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
+
+Hosted deployments (no browser on the machine) can instead supply the session
+cookies in the MFP_COOKIES_JSON environment variable; see mfp_mcp.remote for
+the HTTP transport used to serve the tools over the network.
 """
 
 import asyncio
@@ -50,7 +54,8 @@ logger = logging.getLogger("mfp_mcp")
 mcp = FastMCP("myfitnesspal_mcp")
 
 # Configuration paths
-CONFIG_DIR = Path.home() / ".mfp_mcp"
+# MFP_CONFIG_DIR lets a hosted deployment point this at a persistent volume.
+CONFIG_DIR = Path(os.environ.get("MFP_CONFIG_DIR") or Path.home() / ".mfp_mcp")
 COOKIES_FILE = CONFIG_DIR / "cookies.json"
 
 # MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
@@ -113,6 +118,30 @@ def load_cookies() -> Optional[Dict[str, str]]:
         return cookie_data.get("cookies")
     except Exception as e:
         logger.warning(f"Failed to load cookies: {e}")
+        return None
+
+
+def load_env_cookies() -> Optional[Dict[str, str]]:
+    """
+    Load session cookies from the MFP_COOKIES_JSON environment variable.
+
+    For hosted deployments where no browser is available to scrape. Accepts
+    either a flat {"name": "value"} object or the cookies.json layout
+    ({"cookies": {...}}). Unlike the file, these are not age-limited: the
+    operator owns rotation by updating the variable.
+    """
+    raw = os.environ.get("MFP_COOKIES_JSON")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("cookies"), dict):
+            data = data["cookies"]
+        if not isinstance(data, dict) or not data:
+            raise ValueError("expected a non-empty JSON object")
+        return {str(k): str(v) for k, v in data.items()}
+    except Exception as e:
+        logger.warning(f"Ignoring invalid MFP_COOKIES_JSON: {e}")
         return None
 
 
@@ -701,6 +730,22 @@ def get_mfp_client():
             last_error = e
             logger.warning(f"Stored cookie authentication failed: {e}")
 
+    # Method 2b: cookies supplied via MFP_COOKIES_JSON (hosted deployments).
+    # Tried after the file so a refreshed cookies.json wins, but still reached
+    # when that file holds a dead session.
+    env_cookies = load_env_cookies()
+    if env_cookies:
+        logger.info("Attempting authentication with MFP_COOKIES_JSON cookies")
+        try:
+            cookiejar = dict_to_cookiejar(env_cookies)
+            client = myfitnesspal.Client(cookiejar=cookiejar)
+            _ = client.get_date(date.today())
+            logger.info("Successfully authenticated with MFP_COOKIES_JSON")
+            return client
+        except Exception as e:
+            last_error = e
+            logger.warning(f"MFP_COOKIES_JSON authentication failed: {e}")
+
     # Method 3: Auto-discover Chromium-based browsers (macOS) and pull a live
     # session from whichever one is logged into MFP. This works for Arc,
     # Chrome, Edge, Brave, Vivaldi, Opera, etc. — anything that registers a
@@ -746,7 +791,10 @@ def get_mfp_client():
             "(legacy form-login flow; rarely works against the current "
             "NextAuth backend).\n"
             "3. Manually populate ~/.mfp_mcp/cookies.json with a valid "
-            "session token."
+            "session token.\n"
+            "4. On a hosted server, set MFP_COOKIES_JSON (generate it on a "
+            "machine with a browser via `python -m mfp_mcp.server "
+            "export-cookies`)."
         )
 
 
@@ -3404,9 +3452,11 @@ async def mfp_delete_fast(params: DeleteFastInput) -> str:
         return f"Error deleting fast: {str(e)}"
 
 
-def main():
-    """Run the MCP server."""
-    mcp.run()
+def main(argv: Optional[List[str]] = None):
+    """Run the MCP server (stdio by default; see mfp_mcp.remote for HTTP)."""
+    from mfp_mcp.remote import run_cli
+
+    run_cli(argv)
 
 
 if __name__ == "__main__":

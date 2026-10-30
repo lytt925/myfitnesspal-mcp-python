@@ -494,7 +494,7 @@ Next — encrypt your credentials with Python:
 
 ```
 myfitnesspal-mcp-python/
-├── Dockerfile              # Container deployment
+├── Dockerfile              # Container deployment (HTTP server)
 ├── package.json            # Node tooling (store-key CLI)
 ├── tsconfig.json           # TypeScript config for scripts/
 ├── pyproject.toml          # Python package configuration
@@ -504,6 +504,7 @@ myfitnesspal-mcp-python/
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
+        ├── remote.py       # HTTP transport, bearer auth, export-cookies CLI
         └── server.py       # MCP server implementation
 ```
 
@@ -545,19 +546,93 @@ ruff check src/
 mypy src/
 ```
 
-## Docker Deployment
+## Remote Server (use it from anywhere)
 
-> ⚠️ **Note**: Docker deployment requires mounting your browser's cookie database for authentication.
+By default the server speaks stdio and only works for a client on the same machine. It can
+also run as a network service (MCP **Streamable HTTP**, endpoint `/mcp`) so Claude Code,
+Claude Desktop, Cursor, etc. can reach it from any device.
+
+Three things differ from the local setup:
+
+1. **Authentication to the server.** These tools can modify your diary, so HTTP mode refuses
+   to start without `MFP_MCP_AUTH_TOKEN` (16+ chars). Clients send it as
+   `Authorization: Bearer <token>`.
+2. **MyFitnessPal session.** A server has no browser to scrape. Export the session once from
+   a machine where you are logged into myfitnesspal.com and hand it to the server as
+   `MFP_COOKIES_JSON`:
+
+   ```bash
+   python -m mfp_mcp.server export-cookies            # --browser chrome|firefox|arc|... to pick one
+   ```
+
+   Treat the output like a password. MFP sessions expire eventually; when tools start failing
+   with auth errors, re-run this and update the variable.
+3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare
+   Tunnel, ...). The bearer token travels in a header and must not go over plain HTTP.
+
+### Run it
 
 ```bash
-# Build the image
-docker build -t mfp-mcp .
+# generate a token
+python -c 'import secrets; print(secrets.token_urlsafe(32))'
 
-# Run with Chrome cookies mounted (Linux example)
-docker run -it --rm \
-  -v ~/.config/google-chrome:/root/.config/google-chrome:ro \
-  mfp-mcp
+# directly
+MFP_MCP_AUTH_TOKEN=<token> MFP_COOKIES_JSON='{"...":"..."}' \
+  python -m mfp_mcp.server --transport streamable-http --host 0.0.0.0 --port 8000
+
+# or with Docker (image defaults to HTTP on :8000, cookies persisted in /data)
+docker build -t mfp-mcp .
+docker run -d -p 8000:8000 -v mfp-data:/data \
+  -e MFP_MCP_AUTH_TOKEN=<token> -e MFP_COOKIES_JSON='{"...":"..."}' mfp-mcp
 ```
+
+`GET /healthz` is unauthenticated and returns `ok`, for platform health checks.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MFP_MCP_TRANSPORT` | `stdio` (`streamable-http` in the Docker image) | `stdio` or `streamable-http`; same as `--transport` |
+| `MFP_MCP_HOST` | `127.0.0.1` | Bind address (`--host`) |
+| `MFP_MCP_PORT` / `PORT` | `8000` | Bind port (`--port`) |
+| `MFP_MCP_AUTH_TOKEN` | — | Shared secret; required for HTTP |
+| `MFP_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` headers to accept, e.g. `mfp.example.com` |
+| `MFP_MCP_STATELESS` | `1` | Stateless sessions, so restarts don't invalidate clients |
+| `MFP_MCP_ALLOW_NO_AUTH` | `0` | Skip the token check — only if an authenticating proxy sits in front |
+| `MFP_COOKIES_JSON` | — | MFP session cookies (output of `export-cookies`) |
+| `MFP_CONFIG_DIR` | `~/.mfp_mcp` | Where `cookies.json` is kept; mount a volume here |
+
+In HTTP mode the `refresh_browser_cookies` tool is not exposed (it reads a browser on the
+server, which has none).
+
+### Connect a client
+
+```bash
+# Claude Code
+claude mcp add --transport http myfitnesspal https://mfp.example.com/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Clients that only speak stdio (e.g. Claude Desktop) can bridge with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "myfitnesspal": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mfp.example.com/mcp",
+               "--header", "Authorization: Bearer ${MFP_TOKEN}"],
+      "env": { "MFP_TOKEN": "<token>" }
+    }
+  }
+}
+```
+
+For clients that cannot set headers, `https://mfp.example.com/mcp?token=<token>` is also
+accepted. The secret is then part of the URL, so keep that URL private (access logging is
+disabled in the server for this reason, but proxies in front of it may log it). The server
+does not implement OAuth, so connector UIs that require an OAuth flow cannot use it.
 
 ## Troubleshooting
 
