@@ -202,10 +202,17 @@ def run_import(monkeypatch, capsys, pasted, verify=None):
     return code, out.out, out.err
 
 
-def test_import_turns_a_paste_into_the_env_value(monkeypatch, capsys):
+def test_import_saves_a_paste_and_prints_nothing_secret(monkeypatch, capsys):
     code, out, err = run_import(monkeypatch, capsys, f"Cookie: {SESSION}={SECRET}; _ga=GA1.2")
-    assert code is None and __import__("json").loads(out) == COOKIES
-    assert SECRET not in err
+    assert code is None
+    assert server.load_cookies() == COOKIES
+    assert SECRET not in out and SECRET not in err and "saved to" in err
+
+
+def test_import_accepts_export_cookies_output(monkeypatch, capsys):
+    exported = __import__("json").dumps(COOKIES)
+    code, _, _ = run_import(monkeypatch, capsys, exported)
+    assert code is None and server.load_cookies() == COOKIES
 
 
 @pytest.mark.parametrize("pasted,fragment", [
@@ -216,6 +223,7 @@ def test_import_turns_a_paste_into_the_env_value(monkeypatch, capsys):
 def test_import_rejects_bad_pastes_without_output(monkeypatch, capsys, pasted, fragment):
     code, out, err = run_import(monkeypatch, capsys, pasted)
     assert out == "" and "import-cookies failed" in code and fragment in code
+    assert server.load_cookies() is None
 
 
 def test_import_does_not_print_when_myfitnesspal_rejects(monkeypatch, capsys):
@@ -224,6 +232,7 @@ def test_import_does_not_print_when_myfitnesspal_rejects(monkeypatch, capsys):
 
     code, out, err = run_import(monkeypatch, capsys, f"{SESSION}={SECRET}", verify=reject)
     assert out == "" and SECRET not in err + str(code)
+    assert server.load_cookies() is None  # a rejected session is never stored
 
 
 # --------------------------------------------------------------------------

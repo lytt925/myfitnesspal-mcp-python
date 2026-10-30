@@ -450,7 +450,7 @@ def export_cookies(browser: str, login: bool = False, timeout: float = 300) -> N
 
 
 def import_cookies() -> None:
-    """Read pasted DevTools cookies from stdin and print MFP_COOKIES_JSON."""
+    """Read pasted DevTools cookies (or export-cookies JSON) from stdin and save them."""
     if sys.stdin.isatty():
         print(
             "Paste the Cookie header (or JSON / DevTools rows), then press Ctrl-D:",
@@ -466,10 +466,13 @@ def import_cookies() -> None:
                 "the Cookie request header from the Network tab, not document.cookie."
             )
         verify_session(cookies)
+        server.save_cookies(cookies)
     except Exception as e:
         sys.exit(f"import-cookies failed: {e}")
-    print("Session verified against MyFitnessPal.", file=sys.stderr)
-    print(json.dumps(cookies, separators=(",", ":")))
+    print(
+        f"Session verified against MyFitnessPal and saved to {server.COOKIES_FILE}.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +496,8 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
     sub.add_parser(
         "import-cookies",
-        help="read cookies pasted from browser DevTools on stdin; print MFP_COOKIES_JSON",
+        help="read cookies pasted from browser DevTools (or export-cookies output) "
+             "on stdin, check them, and save them for the server",
     )
     ec = sub.add_parser(
         "export-cookies",
