@@ -31,7 +31,6 @@ import json
 import logging
 import os
 import sys
-import time
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs
 
@@ -353,69 +352,6 @@ def collect_browser_cookies(browser: str = "auto") -> Dict[str, str]:
     return cookies
 
 
-MFP_LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-
-
-def wait_for_login(context, timeout: float, poll: float = 1.0) -> Dict[str, str]:
-    """Poll a Playwright browser context until it holds an MFP session cookie.
-
-    Raises RuntimeError on timeout. `context` only needs a `.cookies()` method
-    returning dicts with name/value/domain, which keeps this unit-testable.
-    """
-    from mfp_mcp import server
-
-    deadline = time.monotonic() + timeout
-    while True:
-        cookies = {
-            c["name"]: c["value"]
-            for c in context.cookies()
-            if c.get("domain", "").lstrip(".").endswith("myfitnesspal.com")
-        }
-        if server._has_real_mfp_session(cookies):
-            return cookies
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"Timed out after {int(timeout)}s waiting for a login.")
-        time.sleep(poll)
-
-
-def login_with_browser(timeout: float = 300, login_url: str = MFP_LOGIN_URL) -> Dict[str, str]:
-    """Open a visible browser, let the user log in, return the session cookies."""
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise RuntimeError(
-            "Playwright is not installed. Run: pip install 'mfp-mcp[login]'"
-        )
-
-    with sync_playwright() as pw:
-        browser = None
-        # Prefer the user's installed Chrome (no download); fall back to the
-        # Chromium that `playwright install chromium` provides.
-        for options in ({"channel": "chrome"}, {}):
-            try:
-                browser = pw.chromium.launch(headless=False, **options)
-                break
-            except PlaywrightError:
-                continue
-        if browser is None:
-            raise RuntimeError(
-                "Could not start a browser. Install Chrome, or run: "
-                "playwright install chromium"
-            )
-        try:
-            context = browser.new_context()
-            context.new_page().goto(login_url)
-            print(
-                "A browser window opened. Log into MyFitnessPal there; this "
-                "continues automatically once you are signed in...",
-                file=sys.stderr,
-            )
-            return wait_for_login(context, timeout)
-        finally:
-            browser.close()
-
-
 def verify_session(cookies: Dict[str, str]) -> None:
     """Make one real MFP request with these cookies. Raises on failure."""
     import cloudscraper
@@ -431,12 +367,9 @@ def verify_session(cookies: Dict[str, str]) -> None:
     client.get_date(date.today())
 
 
-def export_cookies(browser: str, login: bool = False, timeout: float = 300) -> None:
+def export_cookies(browser: str) -> None:
     try:
-        if login:
-            cookies = login_with_browser(timeout)
-        else:
-            cookies = collect_browser_cookies(browser)
+        cookies = collect_browser_cookies(browser)
         verify_session(cookies)
     except Exception as e:
         sys.exit(f"export-cookies failed: {e}")
@@ -504,13 +437,6 @@ def _parser() -> argparse.ArgumentParser:
         help="print MFP_COOKIES_JSON from a local browser session, for a headless server",
     )
     ec.add_argument("--browser", default="auto")
-    ec.add_argument(
-        "--login", action="store_true",
-        help="open a browser window, log in there, and capture the session "
-             "automatically (needs: pip install 'mfp-mcp[login]')",
-    )
-    ec.add_argument("--timeout", type=float, default=300,
-                    help="seconds to wait for the login (with --login)")
     return p
 
 
@@ -519,7 +445,7 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
     if args.command == "import-cookies":
         import_cookies()
     elif args.command == "export-cookies":
-        export_cookies(args.browser, args.login, args.timeout)
+        export_cookies(args.browser)
     elif args.transport == "streamable-http":
         serve_http(args.host, args.port)
     else:

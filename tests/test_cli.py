@@ -69,17 +69,17 @@ def test_unknown_transport_is_rejected(capsys):
 def test_run_cli_dispatches(monkeypatch):
     calls = []
     monkeypatch.setattr(remote, "serve_http", lambda h, p: calls.append(("http", h, p)))
-    monkeypatch.setattr(remote, "export_cookies", lambda b, login, t: calls.append(("export", b, login, t)))
+    monkeypatch.setattr(remote, "export_cookies", lambda b: calls.append(("export", b)))
     monkeypatch.setattr(remote, "import_cookies", lambda: calls.append(("import",)))
     monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append(("stdio",)))
 
     remote.run_cli([])
     remote.run_cli(["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "1234"])
     remote.run_cli(["export-cookies", "--browser", "arc"])
-    remote.run_cli(["export-cookies", "--login", "--timeout", "9"])
+    remote.run_cli(["export-cookies"])
     remote.run_cli(["import-cookies"])
-    assert calls == [("stdio",), ("http", "0.0.0.0", 1234), ("export", "arc", False, 300.0),
-                     ("export", "auto", True, 9.0), ("import",)]
+    assert calls == [("stdio",), ("http", "0.0.0.0", 1234), ("export", "arc"),
+                     ("export", "auto"), ("import",)]
 
 
 def test_main_is_wired_to_the_cli(monkeypatch):
@@ -180,14 +180,6 @@ def test_export_reports_collection_failures(monkeypatch, capsys):
 
     code, out, err = run_export(monkeypatch, capsys, collect=nothing)
     assert out == "" and "No MyFitnessPal session found" in code
-
-
-def test_export_login_mode_uses_the_browser_window(monkeypatch, capsys):
-    seen = {}
-    monkeypatch.setattr(remote, "login_with_browser", lambda timeout: seen.setdefault("t", timeout) and dict(COOKIES))
-    code, out, _ = run_export(monkeypatch, capsys, collect=lambda b: pytest.fail("must not read local browsers"),
-                              login=True, timeout=42)
-    assert code is None and seen["t"] == 42 and SESSION in out
 
 
 def run_import(monkeypatch, capsys, pasted, verify=None):
@@ -303,97 +295,6 @@ def test_a_browser_without_a_login_is_a_clear_error(monkeypatch, platform):
 def test_unknown_browser(monkeypatch):
     with pytest.raises(RuntimeError, match="Unsupported browser"):
         remote.collect_browser_cookies("netscape")
-
-
-# --------------------------------------------------------------------------
-# login window
-# --------------------------------------------------------------------------
-
-def fake_playwright(monkeypatch, *, launch, cookies=()):
-    """Install a stand-in `playwright.sync_api`; `launch(**options)` returns a browser."""
-    class PlaywrightError(Exception):
-        pass
-
-    class Page:
-        def goto(self, url):
-            self.url = url
-
-    class Context:
-        def new_page(self):
-            return Page()
-
-        def cookies(self):
-            return list(cookies)
-
-    class Browser:
-        closed = False
-
-        def new_context(self):
-            return Context()
-
-        def close(self):
-            Browser.closed = True
-
-    class Chromium:
-        launches = []
-
-        def launch(self, **options):
-            Chromium.launches.append(options)
-            return launch(PlaywrightError, Browser, options)
-
-    class Manager:
-        chromium = Chromium()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    api = types.ModuleType("playwright.sync_api")
-    api.Error = PlaywrightError
-    api.sync_playwright = lambda: Manager()
-    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", api)
-    return Chromium, Browser
-
-
-def test_login_without_playwright_installed_says_how_to_get_it(monkeypatch):
-    monkeypatch.setitem(sys.modules, "playwright", None)
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", None)
-    with pytest.raises(RuntimeError, match=r"pip install 'mfp-mcp\[login\]'"):
-        remote.login_with_browser(timeout=1)
-
-
-def test_login_prefers_installed_chrome_then_bundled_chromium(monkeypatch):
-    def launch(err, Browser, options):
-        if options.get("channel") == "chrome":
-            raise err("no chrome here")
-        return Browser()
-
-    Chromium, Browser = fake_playwright(monkeypatch, launch=launch, cookies=[
-        {"name": SESSION, "value": "v", "domain": ".myfitnesspal.com"}])
-    assert remote.login_with_browser(timeout=5) == {SESSION: "v"}
-    assert [o.get("channel") for o in Chromium.launches] == ["chrome", None]
-    assert all(o["headless"] is False for o in Chromium.launches)  # the user has to see it
-    assert Browser.closed
-
-
-def test_login_with_no_usable_browser(monkeypatch):
-    def launch(err, Browser, options):
-        raise err("nope")
-
-    fake_playwright(monkeypatch, launch=launch)
-    with pytest.raises(RuntimeError, match="playwright install chromium"):
-        remote.login_with_browser(timeout=1)
-
-
-def test_login_timeout_still_closes_the_browser(monkeypatch):
-    Chromium, Browser = fake_playwright(monkeypatch, launch=lambda err, B, o: B(), cookies=[])
-    monkeypatch.setattr(remote.time, "sleep", lambda s: None)
-    with pytest.raises(RuntimeError, match="Timed out"):
-        remote.login_with_browser(timeout=0)
-    assert Browser.closed
 
 
 # --------------------------------------------------------------------------
