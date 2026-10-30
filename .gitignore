@@ -226,3 +226,8 @@ tokens.json
 
 # Ignore script to test changes of a PR
 scripts/test_changes.py
+
+# cookies exported or copied from a browser are login credentials
+cookies.txt
+*_cookies.txt
+cookies.json
