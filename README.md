@@ -26,28 +26,51 @@ session cookies. There is no username/password option.
 
 ## Get your cookies
 
-Pick whichever is easiest. Each command checks the session against MyFitnessPal, then prints
-a one-line JSON value for `MFP_COOKIES_JSON`. Treat it like a password, because it is one.
+The server needs two cookies from a logged-in myfitnesspal.com session:
+`__Secure-next-auth.session-token` (starts with `eyJ`) and `_mfp_session`. Treat them like a
+password. Both commands check the session against MyFitnessPal before saving anything.
 
-| Method | Command | Notes |
-|--------|---------|-------|
-| **Read your own browser** | `uv run python -m mfp_mcp.server export-cookies` | You must be logged into myfitnesspal.com. macOS reads Arc/Chrome/Edge/Brave/etc. through the keychain (click **Allow**, not Always Allow); `--browser chrome\|firefox\|arc\|...` picks one |
-| **Open a login window** | `uv run --extra login python -m mfp_mcp.server export-cookies --login` | Opens a browser, you log in, it captures the session. Google/Apple sign-in may be refused in that automated window; use another method then |
-| **Paste from DevTools (F12)** | `uv run python -m mfp_mcp.server import-cookies` | Log in, F12 → Network, reload, click a request to `www.myfitnesspal.com`, copy the whole `Cookie` request header, paste, Ctrl-D |
+**Option A: read your own browser (macOS)**. Log into myfitnesspal.com in Chrome (or Arc, Edge,
+Brave, ...), then:
 
-The paste method accepts Cookie-header text, JSON, "Copy as cURL", and rows copied from
-Application → Cookies. Don't use `document.cookie`: the login cookie is HttpOnly and won't be there.
-On a remote server you can also paste at `https://<server>/session?token=<token>` or
-`curl -X POST https://<server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`.
+```bash
+uv run python -m mfp_mcp.server export-cookies --browser chrome | \
+  uv run python -m mfp_mcp.server import-cookies
+```
+
+macOS asks for access to the browser's keychain entry: type your Mac password only in that system
+dialog, and click **Allow** (not Always Allow) within 2 minutes. `--browser` also takes
+`firefox`, `arc`, `edge`, `brave`, ...
+
+**Option B: paste from DevTools (any OS)**. Log in, press F12 → Application (Firefox: Storage) →
+Cookies → `https://www.myfitnesspal.com`, and copy the *Value* of those two cookies. Then:
+
+```bash
+uv run python -m mfp_mcp.server import-cookies
+```
+
+Paste, then press Ctrl-D:
+
+```
+__Secure-next-auth.session-token=eyJ...
+_mfp_session=...
+```
+
+The whole `Cookie` request header (Network tab), JSON, and "Copy as cURL" are accepted too. Don't
+use `document.cookie`: the login cookie is HttpOnly and won't be there. Paste into the terminal,
+never into a chat or an issue.
+
+Either way the session is saved to `~/.mfp_mcp/cookies.json`, which is where the server reads it.
 
 ### How the server finds the session
 
 It reads, in order:
 
-1. `cookies.json` in `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`): written by the import tools and kept
+1. `cookies.json` in `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`): written by `import-cookies` and kept
    fresh automatically, so normally the newest.
-2. The `MFP_COOKIES_JSON` environment variable: your starting point, and the fallback if the
-   stored session has died.
+2. The `MFP_COOKIES_JSON` environment variable: for hosted setups that cannot run the commands
+   above (`export-cookies` without `| import-cookies` prints the value to use). It is also the
+   fallback if the stored session has died.
 
 MFP's login lasts about 30 days. While the server is in use it asks MFP to re-issue the cookie
 (at most once per 12 hours) and saves it to `cookies.json`, so you normally import cookies **once**.
@@ -65,21 +88,17 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
     "myfitnesspal": {
       "command": "/opt/homebrew/bin/uv",
       "args": ["--directory", "/Users/yourname/myfitnesspal-mcp-python",
-               "run", "python", "-m", "mfp_mcp.server"],
-      "env": {
-        "MFP_COOKIES_JSON": "{\"__Secure-next-auth.session-token\":\"...\"}"
-      }
+               "run", "python", "-m", "mfp_mcp.server"]
     }
   }
 }
 ```
 
 Use **absolute paths** (`which uv` for the first one); Claude Desktop does not inherit your shell
-`PATH`. Paste the value `export-cookies` printed, with the quotes escaped as above. After the first
-successful call the session is saved to `~/.mfp_mcp/cookies.json` and refreshed there. Then **fully
-quit and restart Claude Desktop**.
+`PATH`. The server picks up the session you saved in [Get your cookies](#get-your-cookies), so
+no secret goes in this file. Then **fully quit and restart Claude Desktop**.
 
-For Claude Code: `claude mcp add myfitnesspal -e MFP_COOKIES_JSON='{"...":"..."}' -- uv --directory /path/to/myfitnesspal-mcp-python run python -m mfp_mcp.server`
+For Claude Code: `claude mcp add myfitnesspal -- uv --directory /path/to/myfitnesspal-mcp-python run python -m mfp_mcp.server`
 
 To check that the server starts, run `uv run python -m mfp_mcp.server`; it waits for stdio input
 (`Ctrl+C` to stop).
