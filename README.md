@@ -576,9 +576,16 @@ Three things differ from the local setup:
    python -m mfp_mcp.server export-cookies
    ```
 
-   Treat the output like a password. MFP sessions expire eventually; when tools start failing
-   with auth errors, re-run this and update the variable. This step needs a computer; a phone
-   cannot run it.
+   Treat the output like a password. This step needs a computer; a phone cannot run it.
+
+   **You only do this once.** MFP's login lasts about 30 days, but the server keeps it alive
+   by itself: while it is in use, it asks MFP to re-issue the session cookie (at most once per
+   12 hours) and saves the new one to `cookies.json` under `MFP_CONFIG_DIR`. `MFP_COOKIES_JSON`
+   is then only the starting point, so **mount a persistent volume at `MFP_CONFIG_DIR`**
+   (the Docker image uses `/data`); without one, refreshed cookies are lost on restart.
+   The session still lapses if the server goes unused for ~30 days or you log out / change
+   your password on MFP; then re-run the export and update the variable. Look for
+   `MFP session re-issued; expires ...` in the server log to see the current expiry.
 3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare
    Tunnel, ...). The bearer token travels in a header and must not go over plain HTTP.
 

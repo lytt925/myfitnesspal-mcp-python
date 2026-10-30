@@ -29,7 +29,9 @@ import sys
 import tempfile
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar, Cookie
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
@@ -651,6 +653,83 @@ def authenticate_with_credentials(username: str, password: str) -> Dict[str, str
         raise RuntimeError(f"Authentication failed: {e}")
 
 
+# MFP's NextAuth endpoint. Fetching it with a live session re-issues the
+# session-token cookie, and NextAuth pushes the expiry out (~30 days) once the
+# token is older than its update window, so regular use keeps the login alive.
+MFP_SESSION_URL = "https://www.myfitnesspal.com/api/auth/session"
+SESSION_REFRESH_INTERVAL = timedelta(hours=12)
+
+
+def _cookies_file_age() -> Optional[timedelta]:
+    """Time since cookies.json was last written, or None if unreadable."""
+    try:
+        with open(COOKIES_FILE, "r") as f:
+            saved_at = datetime.fromisoformat(json.load(f)["saved_at"])
+        return datetime.now() - saved_at
+    except Exception:
+        return None
+
+
+def _fetch_refreshed_session(cookies: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Ask MFP to re-issue the session cookies; return the new ones.
+
+    Returns None when MFP reports no active session (empty JSON body), so a
+    dead session can never overwrite a stored one. Cookies being cleared
+    (empty value or already-expired) are ignored.
+    """
+    import requests
+
+    r = requests.get(
+        MFP_SESSION_URL,
+        cookies=cookies,
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    if not r.json():
+        return None
+    updated: Dict[str, str] = {}
+    for header in r.raw.headers.getlist("Set-Cookie"):
+        parsed = SimpleCookie()
+        parsed.load(header)
+        for name, morsel in parsed.items():
+            expires = morsel["expires"]
+            if not morsel.value:
+                continue
+            if expires and parsedate_to_datetime(expires) < datetime.now(timezone.utc):
+                continue
+            updated[name] = morsel.value
+            if "session-token" in name:
+                logger.info(f"MFP session re-issued; expires {expires or 'with browser session'}")
+    return updated
+
+
+def maybe_refresh_session(
+    cookies: Dict[str, str], force: bool = False
+) -> Dict[str, str]:
+    """Keep a working MFP session alive by persisting MFP's re-issued cookies.
+
+    Throttled by cookies.json's age so it costs one extra request per
+    SESSION_REFRESH_INTERVAL, not one per tool call. Never raises: a failed
+    refresh just leaves the current cookies in place.
+    """
+    if not force:
+        age = _cookies_file_age()
+        if age is not None and age < SESSION_REFRESH_INTERVAL:
+            return cookies
+    try:
+        updated = _fetch_refreshed_session(cookies)
+        if not updated:
+            logger.info("MFP returned no active session; not refreshing")
+            return cookies
+        merged = {**cookies, **updated}
+        save_cookies(merged)
+        return merged
+    except Exception as e:
+        logger.warning(f"Session refresh failed (continuing with current cookies): {e}")
+        return cookies
+
+
 def get_mfp_client():
     """
     Get an authenticated MyFitnessPal client.
@@ -729,6 +808,7 @@ def get_mfp_client():
             # Test the connection
             _ = client.get_date(date.today())
             logger.info("Successfully authenticated with stored cookies")
+            maybe_refresh_session(stored_cookies)
             return client
         except Exception as e:
             last_error = e
@@ -745,6 +825,8 @@ def get_mfp_client():
             client = myfitnesspal.Client(cookiejar=cookiejar)
             _ = client.get_date(date.today())
             logger.info("Successfully authenticated with MFP_COOKIES_JSON")
+            # Reached only when cookies.json is absent or dead, so persist now.
+            maybe_refresh_session(env_cookies, force=True)
             return client
         except Exception as e:
             last_error = e
