@@ -26,7 +26,6 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_update_fast` | Write | Update the start/end times of an existing fasting entry |
 | `mfp_delete_fast` | Write | Delete a fasting entry by id |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
-| `refresh_browser_cookies` | Utility | Extract and save session cookies from browser |
 
 ## How diary writes work
 
@@ -84,56 +83,25 @@ Garmin sleep window + first-meal timestamp) or correcting entries programmatical
 
 - **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
 - **MyFitnessPal account**
-- **One of the following for authentication:**
-  - **Recommended (macOS):** any Chromium-based browser (Arc, Chrome, Edge,
-    Brave, Vivaldi, Opera, ...) with an active MyFitnessPal login session —
-    the MCP auto-discovers the session on next call
-  - Firefox with an active MyFitnessPal login session (via the
-    `browser_cookie3` fallback)
-  - Legacy: your MFP username/email and password (see caveats below —
-    MFP's NextAuth backend rejects the form-POST flow, so credential auth
-    only works while cached cookies remain valid)
-
-### Authentication Options
-
-This MCP supports multiple authentication methods:
-
-| Method | Setup | Persistence |
-|--------|-------|-------------|
-| **Chromium browser auto-discovery (macOS, recommended)** | Log into myfitnesspal.com in any Chromium-based browser (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...). The MCP auto-detects installed browsers via the macOS keychain and uses whichever one is logged in. | Until browser session expires (cached for 30 days in `~/.mfp_mcp/cookies.json`) |
-| **Encrypted credentials (legacy)** | Add encrypted `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config; set `MFP_SECRET_KEY` outside the config (for example via shell env or OS keychain) | Form login no longer works against MFP's NextAuth backend — only useful if cached cookies are still valid |
-| **Plain credentials (legacy)** | Add `MFP_USERNAME` and `MFP_PASSWORD` to Claude Desktop config | Same as above — form login flow is deprecated |
-| **Browser cookies (browser_cookie3 fallback)** | Log into myfitnesspal.com in Chrome or Firefox via the default profile paths | Until browser session expires |
-
-> **Note**: MyFitnessPal migrated their authentication to NextAuth, so the
-> legacy form-POST `authenticate_with_credentials` path almost always fails
-> for fresh logins. The Chromium auto-discovery path is the reliable way to
-> get a session on macOS — just log in via any modern browser and the MCP
-> picks it up automatically on the next call.
+- **A logged-in MyFitnessPal session**, passed to the server as cookies. See
+  [Authentication](#authentication); MFP's form login no longer works, so there is
+  no username/password option.
 
 ## Installation
 
-### Option 1: Install from Source (Recommended)
+### Option 1: Install from Source with uv (Recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git
 cd myfitnesspal-mcp-python
 
-# Create virtual environment (use python3.10+ on macOS/Linux)
-python3 -m venv venv
-# On macOS, you may need to specify version: python3.12 -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate  # macOS/Linux
-# On Windows: .\venv\Scripts\activate
-
-# Upgrade pip (required for pyproject.toml support)
-pip install --upgrade pip
-
-# Install the package in editable mode
-pip install -e .
+# Creates .venv with a compatible Python (3.10-3.12) and installs the package.
+# Add --extra login for the browser-window login helper, --extra dev for tests.
+uv sync --python 3.12
 ```
+
+Run anything with `uv run ...` (e.g. `uv run python -m mfp_mcp.server`). Without uv:
+`python3.12 -m venv venv && source venv/bin/activate && pip install -e .`
 
 ### Option 2: Install with pip (when published)
 
@@ -154,250 +122,85 @@ python -m mfp_mcp.server
 
 You should see the server waiting for input (it communicates via stdio). Press `Ctrl+C` to stop.
 
-To test authentication (optional):
+To test that your session cookies work, see [Authentication](#authentication): the
+`export-cookies` and `import-cookies` commands verify against MyFitnessPal before printing.
 
-```bash
-MFP_USERNAME="your_email" MFP_PASSWORD="your_password" python -c "
-from mfp_mcp.server import get_mfp_client
-client = get_mfp_client()
-print('Authentication successful!')
-"
-```
+## Authentication
+
+MyFitnessPal has no public API and its form login no longer works, so the server uses your
+logged-in **session cookies**. It reads them from, in order:
+
+1. `cookies.json` in `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`). Written by the import tools and
+   kept fresh automatically (see below), so it is normally the newest.
+2. The `MFP_COOKIES_JSON` environment variable: the starting point you provide, and the
+   fallback if the stored session has died.
+
+### Get your cookies
+
+Pick whichever is easiest. Each prints a one-line JSON value for `MFP_COOKIES_JSON`
+(after checking it against MyFitnessPal) and treats it like a password, because it is one.
+
+| Method | Command | Notes |
+|--------|---------|-------|
+| **Read your own browser** | `uv run python -m mfp_mcp.server export-cookies` | You must be logged into myfitnesspal.com. macOS reads Arc/Chrome/Edge/Brave/etc. through the keychain (click **Allow**, not Always Allow); `--browser chrome\|firefox\|arc\|...` picks one |
+| **Open a login window** | `uv run --extra login python -m mfp_mcp.server export-cookies --login` | Opens a browser, you log in, it captures the session. Google/Apple sign-in may be refused in that automated window; use another method then |
+| **Paste from DevTools (F12)** | `uv run python -m mfp_mcp.server import-cookies` | Log in, F12 → Network, reload, click a request to `www.myfitnesspal.com`, copy the whole `Cookie` request header, paste, Ctrl-D |
+
+For the paste methods: Cookie-header text, JSON, and rows copied from Application → Cookies are
+all accepted. Don't use `document.cookie`: the login cookie is HttpOnly and won't be there.
+On a hosted server you can also paste at `https://<server>/session?token=<token>` or
+`curl -X POST https://<server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`
+(see [Remote Server](#remote-server-use-it-from-anywhere)).
+
+### The session keeps itself alive
+
+MFP's login lasts about 30 days. While the server is in use it asks MFP to re-issue the
+session cookie (at most once per 12 hours) and saves the new one to `cookies.json`, so you
+normally import cookies **once**. `MFP_COOKIES_JSON` then only matters for the first start.
+The session still lapses if the server sits unused for ~30 days or you log out or change your
+password on MFP; then import fresh cookies again. The log line
+`MFP session re-issued; expires ...` shows the current expiry.
 
 ## Configuration for Claude Desktop
 
-### Step 1: Locate Your Config File
+Config file: macOS `~/Library/Application Support/Claude/claude_desktop_config.json`,
+Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 
-| OS | Config File Location |
-|----|---------------------|
-| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
-
-### Step 2: Add the MCP Server Configuration
-
-If the file doesn't exist, create it. Add or merge the following configuration:
-
-#### Option A: With Encrypted Credentials (Enhanced Security)
-
-Encrypt your credentials before storing them in the config file. See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup instructions.
-
-> ⚠️ **Security note**: Encryption only provides meaningful protection if `MFP_SECRET_KEY` is stored **separately** from the config file (e.g., set in your shell profile or OS keychain). Storing the key alongside the encrypted values in the same config file means anyone who obtains the config can still decrypt your credentials.
-
-**macOS Example** (with key set separately in your shell environment):
 ```json
 {
   "mcpServers": {
     "myfitnesspal": {
-      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
-      "args": ["-m", "mfp_mcp.server"],
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["--directory", "/Users/yourname/myfitnesspal-mcp-python",
+               "run", "python", "-m", "mfp_mcp.server"],
       "env": {
-        "MFP_USERNAME": "gAAAAAB...<encrypted_email>",
-        "MFP_PASSWORD": "gAAAAAB...<encrypted_password>"
+        "MFP_COOKIES_JSON": "{\"__Secure-next-auth.session-token\":\"...\"}"
       }
     }
   }
 }
 ```
 
-#### Option B: With Plain Credentials (No Browser Required)
+Use **absolute paths** (`which uv` for the first one); Claude Desktop does not inherit your shell
+`PATH`. Paste the value `export-cookies` printed, with the quotes escaped as above. After the
+first successful call the session is saved to `~/.mfp_mcp/cookies.json` and refreshed there.
+Then **fully quit and restart Claude Desktop** and try: *"Show my MyFitnessPal diary for today"*.
 
-**macOS Example:**
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
-      "args": ["-m", "mfp_mcp.server"],
-      "env": {
-        "MFP_USERNAME": "your_email@example.com",
-        "MFP_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
+## Security Note on Cookies
 
-**Windows Example:**
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "C:\\Users\\YourName\\myfitnesspal-mcp-python\\venv\\Scripts\\python.exe",
-      "args": ["-m", "mfp_mcp.server"],
-      "env": {
-        "MFP_USERNAME": "your_email@example.com",
-        "MFP_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
+Your session cookies give full access to your MyFitnessPal account, and this server can
+**modify your diary** (food entries, goals, measurements, water, fasting).
 
-#### Option C: Without Credentials (Browser Cookie Fallback)
+- Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
 
-**macOS Example:**
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "/Users/yourname/myfitnesspal-mcp-python/venv/bin/python",
-      "args": ["-m", "mfp_mcp.server"]
-    }
-  }
-}
-```
+  | File | Contents | Mode |
+  |------|----------|------|
+  | `cookies.json` | Session cookies: treat as a password | `0600` |
 
-> ⚠️ **Important**: Use **full absolute paths** to the Python executable in your virtual environment. Replace `yourname`/`YourName` with your actual username.
-
-### Step 3: Restart Claude Desktop
-
-After saving the config file, **completely quit and restart Claude Desktop** for the changes to take effect.
-
-### Step 4: Verify Connection
-
-In Claude Desktop, you should see a hammer icon (🔨) indicating MCP tools are available. Try asking:
-
-> "Show my MyFitnessPal diary for today"
-
-## Authentication Methods
-
-The MCP server supports four authentication methods, tried in this order:
-
-### 1. Environment Variables (Legacy)
-Set `MFP_USERNAME` and `MFP_PASSWORD` in your Claude Desktop config's `env`
-section. You can store them as plain text or encrypted (see below).
-
-> ⚠️ **Note**: MyFitnessPal migrated to a NextAuth backend, so the form-POST
-> flow this method uses no longer produces a session cookie. Credential auth
-> only succeeds while `~/.mfp_mcp/cookies.json` still holds a valid session
-> from a previous browser login — after that, this method silently falls
-> through to the browser cookie paths below. Prefer the Chromium
-> auto-discovery method on macOS.
-
-```json
-"env": {
-  "MFP_USERNAME": "your_email@example.com",
-  "MFP_PASSWORD": "your_password"
-}
-```
-
-### Encrypted Credentials (Enhanced Security)
-
-Instead of storing plain-text credentials, you can encrypt them using [Fernet symmetric encryption](https://cryptography.io/en/latest/fernet/) from the `cryptography` library. The server decrypts them at runtime using `MFP_SECRET_KEY`.
-
-> ⚠️ **Important**: For encryption to be meaningful, `MFP_SECRET_KEY` must be kept **outside** the Claude Desktop config file. The server resolves it in this order:
-> 1. `MFP_SECRET_KEY` environment variable (shell profile, not the Claude config)
-> 2. OS keychain — service `mfp-mcp`, account `MFP_SECRET_KEY` **(recommended)**
-
-**Step 1 — Generate and store the key in one command:**
-
-```bash
-npm install
-npm run store-key
-```
-
-`store-key` generates a Fernet-compatible key, stores it in the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`), and prints the key so you can use it in Step 2. See [Key Management CLI](#key-management-cli) for all available flags.
-
-**Step 2 — Encrypt your credentials:**
-
-```python
-from cryptography.fernet import Fernet
-
-key = b"abc123XYZ...=="  # your key from Step 1
-f = Fernet(key)
-
-encrypted_user = f.encrypt(b"your_email@example.com").decode()
-encrypted_pass = f.encrypt(b"your_password").decode()
-
-print("MFP_USERNAME:", encrypted_user)
-print("MFP_PASSWORD:", encrypted_pass)
-```
-
-**Step 3 — Add only the encrypted values to your Claude Desktop config:**
-
-```json
-"env": {
-  "MFP_USERNAME": "gAAAAAB...<encrypted>",
-  "MFP_PASSWORD": "gAAAAAB...<encrypted>"
-}
-```
-
-The key stays in the keychain — it never touches the config file.
-
-**Alternative: shell profile (simpler, still outside the Claude config):**
-
-```bash
-# Add to ~/.zshrc or ~/.bashrc — do NOT put this in claude_desktop_config.json
-export MFP_SECRET_KEY="abc123XYZ...=="
-```
-
-If `MFP_SECRET_KEY` is not found in the environment or keychain, the server treats `MFP_USERNAME` and `MFP_PASSWORD` as plain text (backward compatible).
-
-### 2. Stored Session Cookies
-After successful authentication, session cookies are saved to `~/.mfp_mcp/cookies.json`. These persist for 30 days, so you won't need to re-authenticate frequently.
-
-### 3. Chromium Browser Auto-Discovery (macOS)
-
-If no credentials are provided and stored cookies are absent or expired, the
-server scans the macOS keychain for `<Browser> Safe Storage` entries to find
-every installed Chromium-based browser, then tries each one's cookies
-database until it finds a valid MyFitnessPal session token.
-
-This works out of the box with Arc, Chrome, Edge, Brave, Vivaldi, Opera,
-Chromium, and any other Chromium-derived browser. You only need to be
-logged into [myfitnesspal.com](https://www.myfitnesspal.com) in one of
-them.
-
-The first successful extraction is persisted to `~/.mfp_mcp/cookies.json`,
-so subsequent calls skip the discovery step until the session expires.
-
-You can also force a specific browser via the `refresh_browser_cookies`
-MCP tool:
-
-```
-refresh_browser_cookies(browser="arc")     # or "chrome", "edge", "brave", ...
-refresh_browser_cookies(browser="auto")    # scan everything (default)
-refresh_browser_cookies(browser="firefox") # via browser_cookie3
-```
-
-### 4. browser_cookie3 Fallback (Legacy)
-A final fallback uses [`browser_cookie3`](https://pypi.org/project/browser-cookie3/)
-to read Chrome or Firefox cookies from the default profile paths. Useful on
-Linux/Windows or if the macOS auto-discovery path can't access your
-keychain.
-
-## Security Note on Credentials
-
-Your MyFitnessPal credentials in the Claude Desktop config are stored locally on your machine. The config file is only readable by your user account. Options to harden this further:
-
-### 1. **Encrypt credentials + store the key in the OS keychain**
-
-The strongest option. The ciphertext lives in the config; the key never does. See [Encrypted Credentials](#encrypted-credentials-enhanced-security).
-
-### 2. **Encrypt credentials + export the key in your shell profile**
-
-Still separates key from ciphertext, though the key is on disk.
-
-### 3. Storing `MFP_PASSWORD` in your MCP client
-
-Storing `MFP_PASSWORD` in your MCP client config puts your MyFitnessPal password in **plaintext
-on disk**, readable by anything running as your user. It is convenient — the server can
-re-authenticate indefinitely — but it is a real tradeoff, not a formality.
-
-### 4. Use browser cookies instead (no credentials stored in config at all)
-
-Prefer browser-cookie auth if you would rather not store the password: log into
-myfitnesspal.com and the server reads the session from your browser. The cost is that MFP
-sessions expire, so you will occasionally need to log in again.
-
-Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
-
-| File | Contents | Mode |
-|------|----------|------|
-| `cookies.json` | Session cookies — full account access, treat as a password | `0600` |
-
-Note that this server can **modify your diary** — adding food entries and updating goals,
-measurements, and water.
+- Put `MFP_COOKIES_JSON` in your platform's secrets store, not in a committed file or a
+  command line. On macOS prefer **Allow** over **Always Allow** at the keychain prompt:
+  "Always" lets that program read the browser's cookie-encryption key from then on.
+- Only cookies for `myfitnesspal.com` are read from your browser.
 
 ## Usage Examples
 
@@ -450,57 +253,13 @@ Once configured, you can interact with your MyFitnessPal data through Claude:
 "Generate a nutrition report for January"
 ```
 
-## Key Management CLI
-
-`scripts/store-key.ts` is a one-time setup tool that generates and stores `MFP_SECRET_KEY` in your OS keychain (macOS Keychain, Windows Credential Vault, Linux Secret Service). Node.js 18+ is required.
-
-### Prerequisites
-
-```bash
-npm install
-```
-
-### Commands
-
-| Command | What it does |
-|---------|-------------|
-| `npm run store-key` | Generate a new Fernet key and store it in the keychain |
-| `npm run store-key -- --key <val>` | Store an existing key instead of generating one |
-| `npm run store-key -- --overwrite` | Replace a key that is already stored |
-| `npm run store-key -- --show` | Print the currently stored key |
-| `npm run store-key -- --delete` | Remove the stored key from the keychain |
-
-### Example output
-
-```
-✅ MFP_SECRET_KEY stored in OS keychain
-   service : mfp-mcp
-   account : MFP_SECRET_KEY
-   source  : generated
-
-Your key (use this to encrypt MFP_USERNAME / MFP_PASSWORD):
-
-  abc123XYZ...==
-
-Next — encrypt your credentials with Python:
-
-  from cryptography.fernet import Fernet
-  f = Fernet(b"abc123XYZ...==")
-  print("MFP_USERNAME:", f.encrypt(b"your_email@example.com").decode())
-  print("MFP_PASSWORD:", f.encrypt(b"your_password").decode())
-```
-
 ## Project Structure
 
 ```
 myfitnesspal-mcp-python/
 ├── Dockerfile              # Container deployment (HTTP server)
-├── package.json            # Node tooling (store-key CLI)
-├── tsconfig.json           # TypeScript config for scripts/
 ├── pyproject.toml          # Python package configuration
 ├── README.md               # This file
-├── scripts/
-│   └── store-key.ts        # One-time key management CLI
 └── src/
     └── mfp_mcp/
         ├── __init__.py     # Package initialization
@@ -558,47 +317,11 @@ Three things differ from the local setup:
 1. **Authentication to the server.** These tools can modify your diary, so HTTP mode refuses
    to start without `MFP_MCP_AUTH_TOKEN` (16+ chars). Clients send it as
    `Authorization: Bearer <token>`.
-2. **MyFitnessPal session.** A server has no browser to scrape. Export the session once
-   from a computer and hand it to the server as `MFP_COOKIES_JSON`. The easiest way is to let
-   the tool open a browser window for you to log into; it detects the login, checks the
-   session against MyFitnessPal, and prints the JSON:
-
-   ```bash
-   pip install -e '.[login]'                    # adds Playwright
-   python -m mfp_mcp.server export-cookies --login
-   ```
-
-   It uses your installed Chrome, or run `playwright install chromium` if you have none.
-   Alternatively, if you are already logged in in a local browser, read it from there
-   (`--browser chrome|firefox|arc|...`; on macOS the default `auto` scans Chromium browsers
-   via the keychain):
-
-   ```bash
-   python -m mfp_mcp.server export-cookies
-   ```
-
-   Treat the output like a password. This step needs a computer.
-
-   **Or paste cookies from DevTools (works from any device, no install).** Log into
-   myfitnesspal.com, press F12 → Network, reload, click any request to `www.myfitnesspal.com`,
-   and copy the whole `Cookie` request header. Then either:
-
-   - open `https://<your-server>/session?token=<MFP_MCP_AUTH_TOKEN>` and paste into the form, or
-   - `curl -X POST https://<your-server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`, or
-   - locally: `python -m mfp_mcp.server import-cookies` (paste, then Ctrl-D) to print `MFP_COOKIES_JSON`.
-
-   The paste is checked against MyFitnessPal first and only saved if it works; values are never
-   echoed back. Cookie header, JSON, and rows copied from Application → Cookies are all accepted.
-   Don't use `document.cookie`: the login cookie is HttpOnly and it won't be there.
-
-   **You only do this once.** MFP's login lasts about 30 days, but the server keeps it alive
-   by itself: while it is in use, it asks MFP to re-issue the session cookie (at most once per
-   12 hours) and saves the new one to `cookies.json` under `MFP_CONFIG_DIR`. `MFP_COOKIES_JSON`
-   is then only the starting point, so **mount a persistent volume at `MFP_CONFIG_DIR`**
-   (the Docker image uses `/data`); without one, refreshed cookies are lost on restart.
-   The session still lapses if the server goes unused for ~30 days or you log out / change
-   your password on MFP; then re-run the export and update the variable. Look for
-   `MFP session re-issued; expires ...` in the server log to see the current expiry.
+2. **MyFitnessPal session.** A server has no browser to read. Get your cookies on a computer
+   (see [Authentication](#authentication)) and pass them as `MFP_COOKIES_JSON`, or paste them at
+   `https://<your-server>/session?token=<MFP_MCP_AUTH_TOKEN>` (works from a phone; the cookies
+   are verified against MFP before saving and never echoed back). Mount a persistent volume at
+   `MFP_CONFIG_DIR` (the Docker image uses `/data`) so the refreshed session survives restarts.
 3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare
    Tunnel, ...). The bearer token travels in a header and must not go over plain HTTP.
 
@@ -633,9 +356,6 @@ docker run -d -p 8000:8000 -v mfp-data:/data \
 | `MFP_MCP_ALLOW_NO_AUTH` | `0` | Skip the token check — only if an authenticating proxy sits in front |
 | `MFP_COOKIES_JSON` | — | MFP session cookies (output of `export-cookies`) |
 | `MFP_CONFIG_DIR` | `~/.mfp_mcp` | Where `cookies.json` is kept; mount a volume here |
-
-In HTTP mode the `refresh_browser_cookies` tool is not exposed (it reads a browser on the
-server, which has none).
 
 ### Connect a client
 
@@ -688,31 +408,20 @@ pip install --upgrade pip
 pip install -e .
 ```
 
-### "Failed to authenticate with MyFitnessPal"
+### "No MyFitnessPal session cookies are configured" / "stored session no longer works"
 
-**Problem**: The server can't authenticate with your credentials or read browser cookies.
+**Problem**: No cookies were provided, or MFP no longer accepts them (expired, or you logged
+out / changed your password).
 
 **Solutions**:
-1. **Easiest (macOS)**: Log into [myfitnesspal.com](https://www.myfitnesspal.com)
-   in any Chromium-based browser (Arc, Chrome, Edge, Brave, ...). The MCP
-   will auto-discover the session on the next call.
-2. **Force a refresh**: Call the `refresh_browser_cookies` tool — `auto`
-   scans every browser, or pass a specific name (`arc`, `chrome`, `edge`,
-   `brave`, `vivaldi`, `opera`, `firefox`).
-3. **If using credentials**: Double-check your MFP_USERNAME and MFP_PASSWORD
-   in the config. Note that the legacy form-login flow no longer works
-   against MFP's NextAuth backend — credentials are only useful while
-   `~/.mfp_mcp/cookies.json` still holds a valid session.
-4. Try logging out and back in to MyFitnessPal in your browser.
-5. Clear `~/.mfp_mcp/cookies.json` and let the auto-discovery rebuild it.
-6. On **macOS**, the auto-discovery path reads each browser's `Safe Storage`
-   password from your login keychain. On the very first run, macOS shows a
-   dialog: *"<binary> wants to use information stored in your keychain"* —
-   click **Always Allow**. If Claude Desktop is spawning the MCP headlessly
-   in the background, this dialog can be easy to miss; if auto-discovery
-   returns "no browser had a session", bring Claude Desktop to the
-   foreground and retry so the prompt is visible. Once approved, the key
-   is cached and the prompt won't repeat.
+1. Import fresh cookies: see [Authentication](#authentication). Then either set
+   `MFP_COOKIES_JSON` or, on a hosted server, paste at `/session`.
+2. If `cookies.json` holds a dead session and `MFP_COOKIES_JSON` is set to a good one, the
+   server falls back to the variable automatically. If neither works, delete
+   `~/.mfp_mcp/cookies.json` and import again.
+3. **`export-cookies` says "No MyFitnessPal session found" (macOS)**: you must click
+   **Allow** on the keychain dialog within 2 minutes, and be logged into myfitnesspal.com in
+   that browser (try `--browser chrome|arc|...`, or use the paste method instead).
 
 ### "No module named 'mfp_mcp'"
 
@@ -893,13 +602,15 @@ Get nutrition report over a date range.
 
 ## Security & Privacy
 
-- **Encrypted Credentials**: Credentials can be stored as Fernet-encrypted ciphertext in your config. `MFP_SECRET_KEY` is resolved at runtime from the environment variable first, then the OS keychain (`mfp-mcp` / `MFP_SECRET_KEY`). See [Encrypted Credentials](#encrypted-credentials-enhanced-security) for setup.
-- **OS Keychain**: Storing `MFP_SECRET_KEY` in the native keychain (macOS Keychain, Windows Credential Vault, Linux Secret Service) means the decryption key never touches the config file or any backup.
-- **Plain Credentials**: If `MFP_SECRET_KEY` is absent from both environment and keychain, `MFP_USERNAME` and `MFP_PASSWORD` are used as-is (backward compatible).
-- **Session Cookies**: After successful authentication, session cookies are cached in `~/.mfp_mcp/cookies.json` (restricted permissions) for 30 days.
-- **Browser Cookies**: As a fallback, the server can read your browser cookies to authenticate with MyFitnessPal.
-- **Local Only**: The server runs locally on your machine via stdio transport. No data is sent to any third-party servers.
-- **No External Transmission**: Your MyFitnessPal data is only transmitted between your computer and MyFitnessPal's servers (myfitnesspal.com).
+- **Session cookies only**: no MyFitnessPal username or password is stored or used. See
+  [Security Note on Cookies](#security-note-on-cookies).
+- **Cookie file**: `~/.mfp_mcp/cookies.json` (or `$MFP_CONFIG_DIR`) is created with owner-only
+  permissions.
+- **Network**: the only outbound connections are to `myfitnesspal.com` and
+  `api.myfitnesspal.com`. No third-party services receive your data.
+- **Local by default**: over stdio the server runs on your machine. If you choose the HTTP
+  mode, it is reachable from the network and protected only by `MFP_MCP_AUTH_TOKEN`: use HTTPS
+  and a long random token, and treat the token as full read/write access to your diary.
 
 ## License
 

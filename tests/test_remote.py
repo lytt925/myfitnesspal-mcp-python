@@ -75,7 +75,7 @@ def test_query_token_reaches_mcp(client):
     assert r.status_code == 200
 
 
-def test_lists_tools_without_local_only_ones(client):
+def test_lists_tools(client):
     auth = {**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"}
     r = client.post(
         "/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers=auth
@@ -86,7 +86,6 @@ def test_lists_tools_without_local_only_ones(client):
     ) if r.text.lstrip().startswith("event:") else r.json()
     names = {t["name"] for t in payload["result"]["tools"]}
     assert "mfp_get_diary" in names
-    assert "refresh_browser_cookies" not in names
 
 
 def test_serve_http_refuses_without_token(monkeypatch):

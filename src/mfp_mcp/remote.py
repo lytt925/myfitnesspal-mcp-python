@@ -32,7 +32,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs
 
 from mcp.server.transport_security import TransportSecuritySettings
@@ -45,8 +45,6 @@ MIN_TOKEN_LENGTH = 16
 HEALTH_PATH = "/healthz"
 SESSION_PATH = "/session"
 MAX_PASTE_BYTES = 64 * 1024
-# Tools that only make sense next to a local browser.
-LOCAL_ONLY_TOOLS = ("refresh_browser_cookies",)
 
 
 class BearerAuthMiddleware:
@@ -239,11 +237,6 @@ def build_http_app(token: Optional[str], stateless: bool = True):
     """Return the ASGI app serving the MCP tools behind the auth gate."""
     from mfp_mcp import server
 
-    for name in LOCAL_ONLY_TOOLS:
-        try:
-            server.mcp.remove_tool(name)
-        except Exception:  # already removed (e.g. build_http_app called twice)
-            pass
     server.mcp.settings.stateless_http = stateless
     # FastMCP defaults to a localhost-only Host allowlist, which answers 421 to
     # any real hostname. Replace it: an explicit allowlist if configured,

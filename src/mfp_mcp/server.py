@@ -5,17 +5,10 @@ A Model Context Protocol (MCP) server that provides tools for interacting
 with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
-Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
-2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Chromium-based browser cookies (macOS): Arc, Chrome, Edge, Brave, Vivaldi,
-   Opera, and any other installed Chromium browser detected via the keychain
-   "Safe Storage" entry.
-4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
-
-Hosted deployments (no browser on the machine) can instead supply the session
-cookies in the MFP_COOKIES_JSON environment variable; see mfp_mcp.remote for
-the HTTP transport used to serve the tools over the network.
+Authentication: MyFitnessPal session cookies, from `cookies.json` in the config
+dir (kept fresh automatically) or the MFP_COOKIES_JSON environment variable.
+See mfp_mcp.remote for the HTTP transport, the /session paste page, and the
+export-cookies / import-cookies helpers that produce those cookies.
 """
 
 import asyncio
@@ -37,12 +30,9 @@ from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
 from collections import OrderedDict
 import time
-from cryptography.fernet import Fernet
-import keyring
 
-import httpx
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 
 # Configure logging to stderr (required for stdio transport)
 logging.basicConfig(
@@ -219,7 +209,7 @@ _CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
                        "com.operasoftware.Opera/Cookies"],
 }
 
-# Friendly browser names accepted by `refresh_browser_cookies("<name>")`
+# Friendly browser names accepted by `export-cookies --browser <name>`
 # mapped to the canonical "Safe Storage" service prefix.
 _CHROMIUM_BROWSER_ALIASES: Dict[str, str] = {
     "arc": "Arc",
@@ -502,157 +492,6 @@ def try_chromium_browsers_for_session_cookies(
     return None
 
 
-def looks_like_fernet_token(value: str) -> bool:
-    """Return True if the value appears to be a Fernet token."""
-    if not value:
-        return False
-    # Fernet tokens are URL-safe base64-encoded and typically begin with "gAAAAA".
-    # Use a lightweight prefix check so plaintext credentials continue to work
-    # even when MFP_SECRET_KEY is configured.
-    #
-    # Edge case: a genuine plaintext password that starts with "gAAAAA" is
-    # misclassified as a ciphertext, fails Fernet decryption, and
-    # `get_decrypted_credential` returns None — credential auth is silently
-    # skipped and the caller falls through to cookie-based auth. Extremely
-    # unlikely for a real password, and the fallback is graceful, so we
-    # accept this heuristic rather than adding a length/base64 check.
-    return value.startswith("gAAAAA")
-
-
-KEYRING_SERVICE = "mfp-mcp"
-KEYRING_SECRET_KEY_ACCOUNT = "MFP_SECRET_KEY"
-
-
-def get_secret_key() -> Optional[str]:
-    """Resolves MFP_SECRET_KEY from, in order:
-    1. The MFP_SECRET_KEY environment variable.
-    2. The OS keychain (service: 'mfp-mcp', account: 'MFP_SECRET_KEY').
-
-    Returns the key string, or None if not found in either location.
-    """
-    key = os.environ.get("MFP_SECRET_KEY")
-    if key:
-        logger.info("MFP_SECRET_KEY loaded from environment variable.")
-        return key
-
-    try:
-        key = keyring.get_password(KEYRING_SERVICE, KEYRING_SECRET_KEY_ACCOUNT)
-        if key:
-            logger.info("MFP_SECRET_KEY loaded from OS keychain.")
-            return key
-    except Exception as e:
-        logger.warning(f"Keychain lookup failed: {e}")
-
-    return None
-
-
-def get_decrypted_credential(env_var_name: str) -> Optional[str]:
-    """Retrieves credentials from environment variables, decrypting Fernet tokens when needed.
-
-    The decryption key (MFP_SECRET_KEY) is resolved from the environment variable first,
-    then from the OS keychain as a fallback.
-
-    Returns the decrypted string on success, the raw value when no decryption is needed,
-    or None if the env var is missing, decryption fails, or the value looks encrypted but
-    no key is available (to avoid passing ciphertext to the auth flow).
-    """
-    encrypted_value = os.environ.get(env_var_name)
-
-    if not encrypted_value:
-        logger.warning(f"Missing {env_var_name}.")
-        return None
-
-    if not looks_like_fernet_token(encrypted_value):
-        # Plain-text credential — no key lookup needed.
-        return encrypted_value
-
-    # Value looks like a Fernet token; resolve the secret key only now.
-    secret_key = get_secret_key()
-
-    if not secret_key:
-        logger.warning(
-            f"{env_var_name} appears to be encrypted but MFP_SECRET_KEY is not set. "
-            "Credential auth will be skipped to avoid passing ciphertext to the auth flow."
-        )
-        return None
-
-    try:
-        f = Fernet(secret_key.encode())
-        return f.decrypt(encrypted_value.encode()).decode()
-    except Exception as e:
-        logger.error(f"Decryption failed for {env_var_name}: {e}")
-        return None
-
-def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    """
-    Authenticate with MyFitnessPal using username/password.
-    
-    Args:
-        username: MyFitnessPal username or email
-        password: MyFitnessPal password
-    
-    Returns:
-        Dictionary of session cookies
-        
-    Raises:
-        RuntimeError: If authentication fails
-    """
-    # Log authentication attempt without exposing the username
-    logger.info("Authenticating with credentials")
-    
-    # MyFitnessPal login URL and endpoints
-    LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-            # First, get the login page to obtain CSRF token
-            response = client.get(LOGIN_URL)
-            response.raise_for_status()
-            
-            # Extract CSRF token from cookies or page
-            cookies = dict(response.cookies)
-            
-            # Attempt login
-            login_data = {
-                "username": username,
-                "password": password,
-            }
-            
-            # Try the standard form login
-            login_response = client.post(
-                LOGIN_URL,
-                data=login_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": LOGIN_URL,
-                },
-            )
-            
-            # MyFitnessPal moved to a NextAuth backend, so the legacy form
-            # POST flow this function uses no longer actually logs the user
-            # in — the endpoint just returns HTTP 200 with a fresh CSRF
-            # cookie. The old success check matched any cookie containing
-            # 'auth' (which `__Host-next-auth.csrf-token` does), reporting
-            # success and overwriting cookies.json with useless pre-auth
-            # cookies. Require a real session token before claiming success.
-            all_cookies = dict(client.cookies)
-            if _has_real_mfp_session(all_cookies):
-                logger.info("Successfully authenticated with credentials")
-                return all_cookies
-            raise RuntimeError(
-                "Login appeared to fail — response contained no session token. "
-                "MyFitnessPal's form login flow does not work against the "
-                "current NextAuth backend. Log into myfitnesspal.com in any "
-                "Chromium-based browser (Arc, Chrome, Edge, Brave, ...) and "
-                "the MCP will pick up the session automatically."
-            )
-                
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"HTTP error during authentication: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Authentication failed: {e}")
-
-
 # MFP's NextAuth endpoint. Fetching it with a live session re-issues the
 # session-token cookie, and NextAuth pushes the expiry out (~30 days) once the
 # token is older than its update window, so regular use keeps the login alive.
@@ -730,27 +569,31 @@ def maybe_refresh_session(
         return cookies
 
 
+def _client_from_cookies(cookies: Dict[str, str]):
+    """Build a client from session cookies and prove they work with one request."""
+    import myfitnesspal
+
+    client = myfitnesspal.Client(cookiejar=dict_to_cookiejar(cookies))
+    _ = client.get_date(date.today())
+    return client
+
+
 def get_mfp_client():
     """
-    Get an authenticated MyFitnessPal client.
+    Get an authenticated MyFitnessPal client from stored session cookies.
 
-    Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-       a. First tries previously-cached cookies for this user.
-       b. Then falls back to form login (only useful on legacy accounts).
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Chrome,
-       Edge, Brave, Vivaldi, Opera, or any other installed Chromium browser
-       via the keychain's "Safe Storage" entries.
-    4. `browser_cookie3` default fallback (legacy Chrome/Firefox paths).
+    Cookies are tried in this order:
+    1. `cookies.json` in the config dir. Written by the cookie import tools and
+       kept alive by `maybe_refresh_session`, so it is normally the freshest.
+    2. The `MFP_COOKIES_JSON` environment variable (the bootstrap, and the
+       fallback when the stored session has died).
 
     Returns:
         myfitnesspal.Client: Authenticated client instance
 
     Raises:
-        RuntimeError: If all authentication methods fail
+        RuntimeError: If no cookies are configured or none of them work
     """
-    import myfitnesspal
     import requests as _requests
     import cloudscraper as _cloudscraper
     # cloudscraper alters TLS fingerprints in a way that triggers MFP's
@@ -759,72 +602,22 @@ def get_mfp_client():
 
     last_error = None
 
-    # Method 1: Try environment variable credentials
-    username = get_decrypted_credential("MFP_USERNAME")
-    password = get_decrypted_credential("MFP_PASSWORD")
-
-    if username and password:
-        logger.info("Attempting authentication with environment credentials")
-
-        # First check if we have valid stored cookies from a previous credential auth
-        stored_cookies = load_cookies()
-        if stored_cookies:
-            logger.info("Found stored session cookies, testing validity...")
-            try:
-                cookiejar = dict_to_cookiejar(stored_cookies)
-                client = myfitnesspal.Client(cookiejar=cookiejar)
-                # Test the connection
-                _ = client.get_date(date.today())
-                logger.info("Stored cookies are valid")
-                return client
-            except Exception as e:
-                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
-
-        # Authenticate with credentials and save cookies
-        try:
-            cookies = authenticate_with_credentials(username, password)
-            save_cookies(cookies)
-
-            # Create client with the new cookies
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with credentials")
-            return client
-
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Credential authentication failed: {e}")
-            # Fall through to other methods
-
-    # Method 2: Try stored session cookies (without credential auth)
     stored_cookies = load_cookies()
     if stored_cookies:
-        logger.info("Attempting authentication with stored cookies")
         try:
-            cookiejar = dict_to_cookiejar(stored_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with stored cookies")
+            client = _client_from_cookies(stored_cookies)
+            logger.info("Authenticated with stored cookies")
             maybe_refresh_session(stored_cookies)
             return client
         except Exception as e:
             last_error = e
             logger.warning(f"Stored cookie authentication failed: {e}")
 
-    # Method 2b: cookies supplied via MFP_COOKIES_JSON (hosted deployments).
-    # Tried after the file so a refreshed cookies.json wins, but still reached
-    # when that file holds a dead session.
     env_cookies = load_env_cookies()
     if env_cookies:
-        logger.info("Attempting authentication with MFP_COOKIES_JSON cookies")
         try:
-            cookiejar = dict_to_cookiejar(env_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with MFP_COOKIES_JSON")
+            client = _client_from_cookies(env_cookies)
+            logger.info("Authenticated with MFP_COOKIES_JSON")
             # Reached only when cookies.json is absent or dead, so persist now.
             maybe_refresh_session(env_cookies, force=True)
             return client
@@ -832,56 +625,18 @@ def get_mfp_client():
             last_error = e
             logger.warning(f"MFP_COOKIES_JSON authentication failed: {e}")
 
-    # Method 3: Auto-discover Chromium-based browsers (macOS) and pull a live
-    # session from whichever one is logged into MFP. This works for Arc,
-    # Chrome, Edge, Brave, Vivaldi, Opera, etc. — anything that registers a
-    # "<Browser> Safe Storage" entry in the macOS keychain.
-    logger.info("Attempting authentication via Chromium browser auto-discovery")
-    try:
-        result = try_chromium_browsers_for_session_cookies()
-        if result:
-            browser_name, chromium_cookies = result
-            cookiejar = dict_to_cookiejar(chromium_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            # Only persist after we've verified it works, so a transient
-            # failure can't poison cookies.json.
-            save_cookies(chromium_cookies)
-            logger.info(
-                f"Successfully authenticated via Chromium auto-discovery "
-                f"({browser_name})"
-            )
-            return client
-        logger.info("No Chromium browser had a usable MFP session")
-    except Exception as e:
-        last_error = e
-        logger.warning(f"Chromium auto-discovery authentication failed: {e}")
-
-    # Method 4: Try browser cookies via browser_cookie3 (legacy fallback)
-    logger.info("Attempting authentication with browser_cookie3 fallback")
-    try:
-        client = myfitnesspal.Client()
-        # Test the connection
-        _ = client.get_date(date.today())
-        logger.info("Successfully authenticated with browser cookies")
-        return client
-    except Exception as e:
-        last_error = e
-        raise RuntimeError(
-            f"All authentication methods failed. Last error: {str(last_error)}\n\n"
-            "Please try one of these solutions:\n"
-            "1. Log into myfitnesspal.com in any Chromium-based browser "
-            "(Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
-            "auto-discover the session on macOS.\n"
-            "2. Set MFP_USERNAME and MFP_PASSWORD in Claude Desktop config "
-            "(legacy form-login flow; rarely works against the current "
-            "NextAuth backend).\n"
-            "3. Manually populate ~/.mfp_mcp/cookies.json with a valid "
-            "session token.\n"
-            "4. On a hosted server, set MFP_COOKIES_JSON (generate it on a "
-            "machine with a browser via `python -m mfp_mcp.server "
-            "export-cookies`)."
-        )
+    problem = (
+        f"The stored session no longer works ({last_error})."
+        if last_error
+        else "No MyFitnessPal session cookies are configured."
+    )
+    raise RuntimeError(
+        f"{problem}\n\n"
+        "Provide fresh cookies from a logged-in browser: set MFP_COOKIES_JSON, or "
+        "paste them at /session on a hosted server. To get the value, run "
+        "`python -m mfp_mcp.server export-cookies` (or `import-cookies` after "
+        "copying the Cookie header from DevTools)."
+    )
 
 
 # ============================================================================
@@ -1638,7 +1393,7 @@ def list_own_foods(client, search: str = "") -> List[Dict[str, Any]]:
     if r.status_code != 200:
         raise RuntimeError(
             f"Could not list own foods: HTTP {r.status_code}. "
-            "The stored session may have expired — run refresh_browser_cookies."
+            "The stored session may have expired — re-import fresh cookies (see README)."
         )
     return r.json() or []
 
@@ -2962,125 +2717,6 @@ async def mfp_get_report(params: GetReportInput) -> str:
 
     except Exception as e:
         return f"Error getting report: {str(e)}"
-
-
-# ============================================================================
-# Cookie Management Tool
-# ============================================================================
-
-
-def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
-    """Verify cookies via a live MFP round-trip, then persist on success.
-
-    Persisting only after verification matches the auto-discovery path's
-    anti-poisoning behavior — a stale/expired session can't clobber a
-    previously good `cookies.json`.
-    """
-    if not _has_real_mfp_session(cookies):
-        return (
-            f"No MyFitnessPal session token found in {source}. "
-            "Make sure you are logged into myfitnesspal.com in that browser, "
-            "then try again."
-        )
-    try:
-        import myfitnesspal
-        cookiejar = dict_to_cookiejar(cookies)
-        client = myfitnesspal.Client(cookiejar=cookiejar)
-        _ = client.get_date(date.today())
-    except Exception as e:
-        return (
-            f"Cookies were extracted from {source} but verification failed: "
-            f"{e}. The session may have expired — log in again and retry. "
-            f"(cookies.json was NOT overwritten.)"
-        )
-    save_cookies(cookies)
-    return (
-        f"Successfully extracted and verified {len(cookies)} cookies "
-        f"from {source}. Authentication is now working."
-    )
-
-
-@mcp.tool()
-def refresh_browser_cookies(browser: str = "auto") -> str:
-    """
-    Extract and save session cookies from your web browser.
-
-    Use this tool when authentication fails and you need to refresh your
-    MyFitnessPal session. You must be logged into myfitnesspal.com in the
-    target browser.
-
-    Args:
-        browser: Source to extract cookies from. Options:
-                 - 'auto' (default): scan every installed Chromium-based
-                   browser on macOS (Arc, Chrome, Edge, Brave, Vivaldi,
-                   Opera, ...) and use the first one with a valid session.
-                 - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
-                   'opera': force a specific Chromium browser (macOS).
-                 - 'firefox': use browser_cookie3 (Firefox is not Chromium).
-
-    Returns:
-        Success message or error description.
-    """
-    browser_key = browser.lower().strip()
-
-    # 'auto' — discover every Chromium browser via keychain Safe Storage
-    if browser_key == "auto":
-        result = try_chromium_browsers_for_session_cookies()
-        if not result:
-            return (
-                "Auto-discovery did not find a Chromium browser with a "
-                "valid MyFitnessPal session. Log into myfitnesspal.com in "
-                "Arc, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
-                "(macOS only — on Linux/Windows, pass 'chrome' or "
-                "'firefox' instead.)"
-            )
-        browser_name, cookies = result
-        return _verify_cookies_and_format(cookies, browser_name)
-
-    # Explicit Chromium browser
-    if browser_key in _CHROMIUM_BROWSER_ALIASES:
-        canonical = _CHROMIUM_BROWSER_ALIASES[browser_key]
-        if sys.platform == "darwin":
-            service_name = f"{canonical} Safe Storage"
-            cookies = _try_extract_from_chromium_browser(service_name)
-            if cookies is None:
-                return (
-                    f"Could not read cookies from {canonical}. Make sure "
-                    "the browser is installed and you have logged in at "
-                    "least once."
-                )
-            return _verify_cookies_and_format(cookies, canonical)
-        # Non-macOS: keychain-based path doesn't apply. browser_cookie3
-        # handles chrome/chromium on Linux/Windows via their default
-        # profile paths; other Chromium browsers aren't supported there.
-        if browser_key in ("chrome", "chromium"):
-            try:
-                import browser_cookie3
-                cj = browser_cookie3.chrome(domain_name=".myfitnesspal.com")
-                cookies = {c.name: c.value for c in cj}
-            except Exception as e:
-                return f"Error extracting cookies from {browser_key}: {e}"
-            return _verify_cookies_and_format(cookies, browser_key)
-        return (
-            f"{canonical} cookie extraction requires macOS (keychain-backed "
-            f"Safe Storage). On this platform, use 'chrome' or 'firefox'."
-        )
-
-    # Firefox via browser_cookie3 (it has its own format, not Chromium)
-    if browser_key == "firefox":
-        try:
-            import browser_cookie3
-            cj = browser_cookie3.firefox(domain_name=".myfitnesspal.com")
-            cookies = {c.name: c.value for c in cj}
-        except Exception as e:
-            return f"Error extracting cookies from firefox: {e}"
-        return _verify_cookies_and_format(cookies, "firefox")
-
-    valid_options = sorted({*_CHROMIUM_BROWSER_ALIASES, "firefox", "auto"})
-    return (
-        f"Unsupported browser: {browser!r}. Use 'auto' to scan all installed "
-        f"Chromium browsers, or one of: {', '.join(valid_options)}."
-    )
 
 
 # ============================================================================
