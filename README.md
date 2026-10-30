@@ -1,8 +1,166 @@
 # MyFitnessPal MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI assistants like Claude to interact with your MyFitnessPal data, including food diary, exercises, body measurements, nutrition goals, and water intake.
+An [MCP](https://modelcontextprotocol.io/) server that lets AI assistants such as Claude read and
+write your MyFitnessPal data: food diary, exercise, body measurements, goals, water, steps and fasting.
 
-## Features
+It runs two ways:
+
+| | Local | Remote |
+|---|---|---|
+| Transport | stdio, started by your MCP client | Streamable HTTP at `/mcp` |
+| Works from | the machine it is installed on | any device that can reach the server |
+| Good for | Claude Desktop, Claude Code on one computer | several devices, a phone, a hosted setup |
+| Setup | [Run locally](#run-locally) | [Run remotely](#run-remotely) |
+
+Either way you need **Python 3.10–3.12** (or Docker for remote) and a **logged-in MyFitnessPal session**.
+MFP's form login no longer works and has no public API, so the server authenticates with your
+session cookies. There is no username/password option.
+
+## Quick start
+
+1. Install: `git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git && cd myfitnesspal-mcp-python && uv sync --python 3.12`
+   (needs [uv](https://docs.astral.sh/uv/); it picks a compatible Python for you).
+2. [Get your cookies](#get-your-cookies).
+3. Connect a client: [locally](#run-locally) or [remotely](#run-remotely).
+4. Ask: *"Show my MyFitnessPal diary for today"*.
+
+## Get your cookies
+
+Pick whichever is easiest. Each command checks the session against MyFitnessPal, then prints
+a one-line JSON value for `MFP_COOKIES_JSON`. Treat it like a password, because it is one.
+
+| Method | Command | Notes |
+|--------|---------|-------|
+| **Read your own browser** | `uv run python -m mfp_mcp.server export-cookies` | You must be logged into myfitnesspal.com. macOS reads Arc/Chrome/Edge/Brave/etc. through the keychain (click **Allow**, not Always Allow); `--browser chrome\|firefox\|arc\|...` picks one |
+| **Open a login window** | `uv run --extra login python -m mfp_mcp.server export-cookies --login` | Opens a browser, you log in, it captures the session. Google/Apple sign-in may be refused in that automated window; use another method then |
+| **Paste from DevTools (F12)** | `uv run python -m mfp_mcp.server import-cookies` | Log in, F12 → Network, reload, click a request to `www.myfitnesspal.com`, copy the whole `Cookie` request header, paste, Ctrl-D |
+
+The paste method accepts Cookie-header text, JSON, "Copy as cURL", and rows copied from
+Application → Cookies. Don't use `document.cookie`: the login cookie is HttpOnly and won't be there.
+On a remote server you can also paste at `https://<server>/session?token=<token>` or
+`curl -X POST https://<server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`.
+
+### How the server finds the session
+
+It reads, in order:
+
+1. `cookies.json` in `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`): written by the import tools and kept
+   fresh automatically, so normally the newest.
+2. The `MFP_COOKIES_JSON` environment variable: your starting point, and the fallback if the
+   stored session has died.
+
+MFP's login lasts about 30 days. While the server is in use it asks MFP to re-issue the cookie
+(at most once per 12 hours) and saves it to `cookies.json`, so you normally import cookies **once**.
+The session lapses if the server sits unused for ~30 days or you log out or change your password on
+MFP; then import fresh cookies. The log line `MFP session re-issued; expires ...` shows the expiry.
+
+## Run locally
+
+Config file: macOS `~/Library/Application Support/Claude/claude_desktop_config.json`,
+Windows `%APPDATA%\Claude\claude_desktop_config.json`.
+
+```json
+{
+  "mcpServers": {
+    "myfitnesspal": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["--directory", "/Users/yourname/myfitnesspal-mcp-python",
+               "run", "python", "-m", "mfp_mcp.server"],
+      "env": {
+        "MFP_COOKIES_JSON": "{\"__Secure-next-auth.session-token\":\"...\"}"
+      }
+    }
+  }
+}
+```
+
+Use **absolute paths** (`which uv` for the first one); Claude Desktop does not inherit your shell
+`PATH`. Paste the value `export-cookies` printed, with the quotes escaped as above. After the first
+successful call the session is saved to `~/.mfp_mcp/cookies.json` and refreshed there. Then **fully
+quit and restart Claude Desktop**.
+
+For Claude Code: `claude mcp add myfitnesspal -e MFP_COOKIES_JSON='{"...":"..."}' -- uv --directory /path/to/myfitnesspal-mcp-python run python -m mfp_mcp.server`
+
+To check that the server starts, run `uv run python -m mfp_mcp.server`; it waits for stdio input
+(`Ctrl+C` to stop).
+
+## Run remotely
+
+The server can run as a network service so Claude Code, Claude Desktop, Cursor, etc. can reach it
+from any device. Three things differ from the local setup:
+
+1. **Server authentication.** These tools can modify your diary, so HTTP mode refuses to start
+   without `MFP_MCP_AUTH_TOKEN` (16+ chars). Clients send it as `Authorization: Bearer <token>`.
+2. **MyFitnessPal session.** A server has no browser to read. [Get your cookies](#get-your-cookies)
+   on a computer and pass them as `MFP_COOKIES_JSON`, or paste them at
+   `https://<your-server>/session?token=<MFP_MCP_AUTH_TOKEN>` (works from a phone; cookies are
+   verified against MFP before saving and never echoed back). Mount a persistent volume at
+   `MFP_CONFIG_DIR` (the Docker image uses `/data`) so the refreshed session survives restarts.
+3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare Tunnel, ...).
+   The bearer token travels in a header and must not go over plain HTTP.
+
+### Start the server
+
+```bash
+# generate a token
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+
+# directly
+MFP_MCP_AUTH_TOKEN=<token> MFP_COOKIES_JSON='{"...":"..."}' \
+  uv run python -m mfp_mcp.server --transport streamable-http --host 0.0.0.0 --port 8000
+
+# or with Docker (image defaults to HTTP on :8000, cookies persisted in /data)
+docker build -t mfp-mcp .
+docker run -d -p 8000:8000 -v mfp-data:/data \
+  -e MFP_MCP_AUTH_TOKEN=<token> -e MFP_COOKIES_JSON='{"...":"..."}' mfp-mcp
+```
+
+`GET /healthz` is unauthenticated and returns `ok`, for platform health checks.
+
+### Connect a client
+
+```bash
+# Claude Code
+claude mcp add --transport http myfitnesspal https://mfp.example.com/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Clients that only speak stdio (e.g. Claude Desktop) can bridge with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "myfitnesspal": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mfp.example.com/mcp",
+               "--header", "Authorization: Bearer ${MFP_TOKEN}"],
+      "env": { "MFP_TOKEN": "<token>" }
+    }
+  }
+}
+```
+
+For clients that cannot set headers, `https://mfp.example.com/mcp?token=<token>` is also accepted.
+The secret is then part of the URL, so keep it private (the server disables access logging for this
+reason, but proxies in front of it may log it). The server does not implement OAuth, so connector UIs
+that require an OAuth flow cannot use it.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MFP_MCP_TRANSPORT` | `stdio` (`streamable-http` in the Docker image) | `stdio` or `streamable-http`; same as `--transport` |
+| `MFP_MCP_HOST` | `127.0.0.1` | Bind address (`--host`) |
+| `MFP_MCP_PORT` / `PORT` | `8000` | Bind port (`--port`) |
+| `MFP_MCP_AUTH_TOKEN` | — | Shared secret; required for HTTP |
+| `MFP_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` headers to accept, e.g. `mfp.example.com` |
+| `MFP_MCP_STATELESS` | `1` | Stateless sessions, so restarts don't invalidate clients |
+| `MFP_MCP_ALLOW_NO_AUTH` | `0` | Skip the token check — only if an authenticating proxy sits in front |
+| `MFP_COOKIES_JSON` | — | MFP session cookies (output of `export-cookies`) |
+| `MFP_CONFIG_DIR` | `~/.mfp_mcp` | Where `cookies.json` is kept; mount a volume here |
+
+## Tools
 
 | Tool | Type | Description |
 |------|------|-------------|
@@ -27,7 +185,17 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 | `mfp_delete_fast` | Write | Delete a fasting entry by id |
 | `mfp_get_report` | Read | Get nutrition reports over a date range |
 
-## How diary writes work
+Example prompts: *"What did I eat today?"*, *"Log 6 oz grilled chicken for lunch"*,
+*"Log my weight as 232.5 pounds"*, *"How many calories do I have left today?"*,
+*"Average protein this week?"*
+
+Details for each tool are in the [Tool reference](#tool-reference).
+
+## How it works
+
+MyFitnessPal has no public API, so none of this is officially supported.
+
+### How diary writes work
 
 MyFitnessPal has no public API. Reads here are scraped from the website via
 [`python-myfitnesspal`](https://github.com/coddingtonbear/python-myfitnesspal), and **diary
@@ -45,7 +213,7 @@ but MyFitnessPal can change it without notice. They have already done so once: t
 originally posted to `/food/diary/{user}/add`, which now returns 404, leaving food logging
 broken. If logging starts failing, that is the most likely cause.
 
-## How fasting works (write-only)
+### How fasting works (write-only)
 
 **Fasting tools** (`mfp_log_fast`, `mfp_update_fast`, `mfp_delete_fast`) POST / PATCH /
 DELETE against `/v2/diary/fasting_entry` on the same v2 JSON API. Payloads match the
@@ -74,404 +242,7 @@ until Under Armour publishes something.
 The write tools are still useful for automating log-entry (e.g. inferring fasts from your
 Garmin sleep window + first-meal timestamp) or correcting entries programmatically.
 
-## Prerequisites
-
-- **Python 3.10–3.12** (check with `python3 --version`)
-
-  Not 3.13+: `lxml`, pulled in by `myfitnesspal`, has no wheels for it and fails to build
-  against the 3.14 C API. On macOS, `brew install python@3.12`.
-
-- **pip 21.3+** (for pyproject.toml support; upgrade with `pip install --upgrade pip`)
-- **MyFitnessPal account**
-- **A logged-in MyFitnessPal session**, passed to the server as cookies. See
-  [Authentication](#authentication); MFP's form login no longer works, so there is
-  no username/password option.
-
-## Installation
-
-### Option 1: Install from Source with uv (Recommended)
-
-```bash
-git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git
-cd myfitnesspal-mcp-python
-
-# Creates .venv with a compatible Python (3.10-3.12) and installs the package.
-# Add --extra login for the browser-window login helper, --extra dev for tests.
-uv sync --python 3.12
-```
-
-Run anything with `uv run ...` (e.g. `uv run python -m mfp_mcp.server`). Without uv:
-`python3.12 -m venv venv && source venv/bin/activate && pip install -e .`
-
-### Option 2: Install with pip (when published)
-
-```bash
-pip install mfp-mcp
-```
-
-> **Note**: Option 2 requires the package to be published to PyPI. For now, use Option 1.
-
-### Verify Installation
-
-After installation, verify the server can start:
-
-```bash
-# With venv activated
-python -m mfp_mcp.server
-```
-
-You should see the server waiting for input (it communicates via stdio). Press `Ctrl+C` to stop.
-
-To test that your session cookies work, see [Authentication](#authentication): the
-`export-cookies` and `import-cookies` commands verify against MyFitnessPal before printing.
-
-## Authentication
-
-MyFitnessPal has no public API and its form login no longer works, so the server uses your
-logged-in **session cookies**. It reads them from, in order:
-
-1. `cookies.json` in `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`). Written by the import tools and
-   kept fresh automatically (see below), so it is normally the newest.
-2. The `MFP_COOKIES_JSON` environment variable: the starting point you provide, and the
-   fallback if the stored session has died.
-
-### Get your cookies
-
-Pick whichever is easiest. Each prints a one-line JSON value for `MFP_COOKIES_JSON`
-(after checking it against MyFitnessPal) and treats it like a password, because it is one.
-
-| Method | Command | Notes |
-|--------|---------|-------|
-| **Read your own browser** | `uv run python -m mfp_mcp.server export-cookies` | You must be logged into myfitnesspal.com. macOS reads Arc/Chrome/Edge/Brave/etc. through the keychain (click **Allow**, not Always Allow); `--browser chrome\|firefox\|arc\|...` picks one |
-| **Open a login window** | `uv run --extra login python -m mfp_mcp.server export-cookies --login` | Opens a browser, you log in, it captures the session. Google/Apple sign-in may be refused in that automated window; use another method then |
-| **Paste from DevTools (F12)** | `uv run python -m mfp_mcp.server import-cookies` | Log in, F12 → Network, reload, click a request to `www.myfitnesspal.com`, copy the whole `Cookie` request header, paste, Ctrl-D |
-
-For the paste methods: Cookie-header text, JSON, and rows copied from Application → Cookies are
-all accepted. Don't use `document.cookie`: the login cookie is HttpOnly and won't be there.
-On a hosted server you can also paste at `https://<server>/session?token=<token>` or
-`curl -X POST https://<server>/session -H "Authorization: Bearer <token>" --data-binary @cookies.txt`
-(see [Remote Server](#remote-server-use-it-from-anywhere)).
-
-### The session keeps itself alive
-
-MFP's login lasts about 30 days. While the server is in use it asks MFP to re-issue the
-session cookie (at most once per 12 hours) and saves the new one to `cookies.json`, so you
-normally import cookies **once**. `MFP_COOKIES_JSON` then only matters for the first start.
-The session still lapses if the server sits unused for ~30 days or you log out or change your
-password on MFP; then import fresh cookies again. The log line
-`MFP session re-issued; expires ...` shows the current expiry.
-
-## Configuration for Claude Desktop
-
-Config file: macOS `~/Library/Application Support/Claude/claude_desktop_config.json`,
-Windows `%APPDATA%\Claude\claude_desktop_config.json`.
-
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "/opt/homebrew/bin/uv",
-      "args": ["--directory", "/Users/yourname/myfitnesspal-mcp-python",
-               "run", "python", "-m", "mfp_mcp.server"],
-      "env": {
-        "MFP_COOKIES_JSON": "{\"__Secure-next-auth.session-token\":\"...\"}"
-      }
-    }
-  }
-}
-```
-
-Use **absolute paths** (`which uv` for the first one); Claude Desktop does not inherit your shell
-`PATH`. Paste the value `export-cookies` printed, with the quotes escaped as above. After the
-first successful call the session is saved to `~/.mfp_mcp/cookies.json` and refreshed there.
-Then **fully quit and restart Claude Desktop** and try: *"Show my MyFitnessPal diary for today"*.
-
-## Security Note on Cookies
-
-Your session cookies give full access to your MyFitnessPal account, and this server can
-**modify your diary** (food entries, goals, measurements, water, fasting).
-
-- Files this server writes to `~/.mfp_mcp/` (directory mode `0700`):
-
-  | File | Contents | Mode |
-  |------|----------|------|
-  | `cookies.json` | Session cookies: treat as a password | `0600` |
-
-- Put `MFP_COOKIES_JSON` in your platform's secrets store, not in a committed file or a
-  command line. On macOS prefer **Allow** over **Always Allow** at the keychain prompt:
-  "Always" lets that program read the browser's cookie-encryption key from then on.
-- Only cookies for `myfitnesspal.com` are read from your browser.
-
-## Usage Examples
-
-Once configured, you can interact with your MyFitnessPal data through Claude:
-
-### Food Diary
-```
-"Show me what I ate today"
-"Get my food diary for 2026-01-05"
-"What meals did I log yesterday?"
-```
-
-### Logging and Correcting Food
-```
-"Log a grilled chicken breast, 6 oz, for lunch"
-"Add 2 cups of oatmeal to breakfast"
-```
-
-### Track Weight Progress
-```
-"Show my weight history for the past 30 days"
-"Log my weight as 232.5 pounds"
-"What's my weight trend this month?"
-```
-
-### Search Foods
-```
-"Search MyFitnessPal for chicken breast"
-"Find nutrition info for Greek yogurt"
-"Look up calories in a banana"
-```
-
-### Check Goals vs Actual
-```
-"Compare my nutrition goals to what I actually ate today"
-"Am I on track with my protein intake?"
-"How many calories do I have left today?"
-```
-
-### Exercise Log
-```
-"What exercises did I log today?"
-"Show my workout from yesterday"
-```
-
-### Nutrition Reports
-```
-"Show my calorie intake over the past week"
-"What's my average protein intake this week?"
-"Generate a nutrition report for January"
-```
-
-## Project Structure
-
-```
-myfitnesspal-mcp-python/
-├── Dockerfile              # Container deployment (HTTP server)
-├── pyproject.toml          # Python package configuration
-├── README.md               # This file
-└── src/
-    └── mfp_mcp/
-        ├── __init__.py     # Package initialization
-        ├── cookie_paste.py # Parse cookies pasted from DevTools
-        ├── remote.py       # HTTP transport, bearer auth, /session, cookie CLIs
-        └── server.py       # MCP server implementation
-```
-
-## Development
-
-### Setup Development Environment
-
-```bash
-# Clone and enter directory
-git clone https://github.com/YOUR_USERNAME/myfitnesspal-mcp-python.git
-cd myfitnesspal-mcp-python
-
-# Create virtual environment (Python 3.10+ required)
-python3 -m venv venv
-source venv/bin/activate
-
-# Upgrade pip and install with dev dependencies
-pip install --upgrade pip
-pip install -e ".[dev]"
-```
-
-### Run Tests
-
-```bash
-pytest
-```
-
-### Code Formatting
-
-```bash
-black src/
-isort src/
-ruff check src/
-```
-
-### Type Checking
-
-```bash
-mypy src/
-```
-
-## Remote Server (use it from anywhere)
-
-By default the server speaks stdio and only works for a client on the same machine. It can
-also run as a network service (MCP **Streamable HTTP**, endpoint `/mcp`) so Claude Code,
-Claude Desktop, Cursor, etc. can reach it from any device.
-
-Three things differ from the local setup:
-
-1. **Authentication to the server.** These tools can modify your diary, so HTTP mode refuses
-   to start without `MFP_MCP_AUTH_TOKEN` (16+ chars). Clients send it as
-   `Authorization: Bearer <token>`.
-2. **MyFitnessPal session.** A server has no browser to read. Get your cookies on a computer
-   (see [Authentication](#authentication)) and pass them as `MFP_COOKIES_JSON`, or paste them at
-   `https://<your-server>/session?token=<MFP_MCP_AUTH_TOKEN>` (works from a phone; the cookies
-   are verified against MFP before saving and never echoed back). Mount a persistent volume at
-   `MFP_CONFIG_DIR` (the Docker image uses `/data`) so the refreshed session survives restarts.
-3. **TLS.** Put the server behind HTTPS (Fly.io, Render, Cloud Run, Caddy, a Cloudflare
-   Tunnel, ...). The bearer token travels in a header and must not go over plain HTTP.
-
-### Run it
-
-```bash
-# generate a token
-python -c 'import secrets; print(secrets.token_urlsafe(32))'
-
-# directly
-MFP_MCP_AUTH_TOKEN=<token> MFP_COOKIES_JSON='{"...":"..."}' \
-  python -m mfp_mcp.server --transport streamable-http --host 0.0.0.0 --port 8000
-
-# or with Docker (image defaults to HTTP on :8000, cookies persisted in /data)
-docker build -t mfp-mcp .
-docker run -d -p 8000:8000 -v mfp-data:/data \
-  -e MFP_MCP_AUTH_TOKEN=<token> -e MFP_COOKIES_JSON='{"...":"..."}' mfp-mcp
-```
-
-`GET /healthz` is unauthenticated and returns `ok`, for platform health checks.
-
-### Configuration
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `MFP_MCP_TRANSPORT` | `stdio` (`streamable-http` in the Docker image) | `stdio` or `streamable-http`; same as `--transport` |
-| `MFP_MCP_HOST` | `127.0.0.1` | Bind address (`--host`) |
-| `MFP_MCP_PORT` / `PORT` | `8000` | Bind port (`--port`) |
-| `MFP_MCP_AUTH_TOKEN` | — | Shared secret; required for HTTP |
-| `MFP_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` headers to accept, e.g. `mfp.example.com` |
-| `MFP_MCP_STATELESS` | `1` | Stateless sessions, so restarts don't invalidate clients |
-| `MFP_MCP_ALLOW_NO_AUTH` | `0` | Skip the token check — only if an authenticating proxy sits in front |
-| `MFP_COOKIES_JSON` | — | MFP session cookies (output of `export-cookies`) |
-| `MFP_CONFIG_DIR` | `~/.mfp_mcp` | Where `cookies.json` is kept; mount a volume here |
-
-### Connect a client
-
-```bash
-# Claude Code
-claude mcp add --transport http myfitnesspal https://mfp.example.com/mcp \
-  --header "Authorization: Bearer <token>"
-```
-
-Clients that only speak stdio (e.g. Claude Desktop) can bridge with
-[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
-
-```json
-{
-  "mcpServers": {
-    "myfitnesspal": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mfp.example.com/mcp",
-               "--header", "Authorization: Bearer ${MFP_TOKEN}"],
-      "env": { "MFP_TOKEN": "<token>" }
-    }
-  }
-}
-```
-
-For clients that cannot set headers, `https://mfp.example.com/mcp?token=<token>` is also
-accepted. The secret is then part of the URL, so keep that URL private (access logging is
-disabled in the server for this reason, but proxies in front of it may log it). The server
-does not implement OAuth, so connector UIs that require an OAuth flow cannot use it.
-
-## Troubleshooting
-
-### "python: command not found" or wrong Python version
-
-**Problem**: Python is not in PATH or you need to specify version.
-
-**Solutions**:
-1. On macOS/Linux, use `python3` instead of `python`
-2. Check your version: `python3 --version` (must be 3.10+)
-3. If needed, install Python 3.12 via Homebrew: `brew install python@3.12`
-4. Then create venv with: `python3.12 -m venv venv`
-
-### "pip install -e ." fails with "setup.py not found"
-
-**Problem**: Your pip version is too old to support pyproject.toml builds.
-
-**Solution**: Upgrade pip first:
-```bash
-pip install --upgrade pip
-pip install -e .
-```
-
-### "No MyFitnessPal session cookies are configured" / "stored session no longer works"
-
-**Problem**: No cookies were provided, or MFP no longer accepts them (expired, or you logged
-out / changed your password).
-
-**Solutions**:
-1. Import fresh cookies: see [Authentication](#authentication). Then either set
-   `MFP_COOKIES_JSON` or, on a hosted server, paste at `/session`.
-2. If `cookies.json` holds a dead session and `MFP_COOKIES_JSON` is set to a good one, the
-   server falls back to the variable automatically. If neither works, delete
-   `~/.mfp_mcp/cookies.json` and import again.
-3. **`export-cookies` says "No MyFitnessPal session found" (macOS)**: you must click
-   **Allow** on the keychain dialog within 2 minutes, and be logged into myfitnesspal.com in
-   that browser (try `--browser chrome|arc|...`, or use the paste method instead).
-
-### "No module named 'mfp_mcp'"
-
-**Problem**: Package not installed or wrong Python environment.
-
-**Solutions**:
-1. Ensure you're using the correct Python from your virtual environment
-2. Reinstall the package: `pip install -e .`
-3. Verify the path in your Claude Desktop config points to the venv Python:
-   ```
-   /path/to/project/venv/bin/python  # macOS/Linux
-   C:\path\to\project\venv\Scripts\python.exe  # Windows
-   ```
-
-### Tools not appearing in Claude Desktop
-
-**Problem**: MCP server not connecting.
-
-**Solutions**:
-1. Check the config file syntax (must be valid JSON - use a JSON validator)
-2. Use **absolute paths** in the configuration (no `~` or relative paths)
-3. Restart Claude Desktop completely (Cmd+Q on macOS, then relaunch)
-4. Check Claude Desktop logs:
-   - macOS: `~/Library/Logs/Claude/`
-   - Windows: `%APPDATA%\Claude\logs\`
-
-### Empty responses or no data
-
-**Problem**: Authentication works but no data returned.
-
-**Solutions**:
-1. Verify you have data logged in MyFitnessPal for the requested date
-2. Check the date format (YYYY-MM-DD)
-3. Try a recent date where you know you have entries
-
-### Double parentheses in terminal prompt like "((venv) )"
-
-**Problem**: VS Code/Cursor Python extension bug with venv prompt.
-
-**Solutions**:
-1. Update the Python extension in VS Code/Cursor
-2. Or manually fix the venv activate script - change line ~70 in `venv/bin/activate`:
-   ```bash
-   # Change from:
-   PS1="("'(venv) '") ${PS1:-}"
-   # To:
-   PS1="(venv) ${PS1:-}"
-   ```
-
-## API Reference
+## Tool reference
 
 ### mfp_get_diary
 Get food diary for a specific date.
@@ -600,17 +371,61 @@ Get nutrition report over a date range.
 - `end_date` (optional): YYYY-MM-DD (default today)
 - `response_format`: "markdown" or "json"
 
-## Security & Privacy
+## Security
 
-- **Session cookies only**: no MyFitnessPal username or password is stored or used. See
-  [Security Note on Cookies](#security-note-on-cookies).
-- **Cookie file**: `~/.mfp_mcp/cookies.json` (or `$MFP_CONFIG_DIR`) is created with owner-only
-  permissions.
-- **Network**: the only outbound connections are to `myfitnesspal.com` and
-  `api.myfitnesspal.com`. No third-party services receive your data.
-- **Local by default**: over stdio the server runs on your machine. If you choose the HTTP
-  mode, it is reachable from the network and protected only by `MFP_MCP_AUTH_TOKEN`: use HTTPS
-  and a long random token, and treat the token as full read/write access to your diary.
+Your session cookies give full access to your MyFitnessPal account, and this server can
+**modify your diary** (food entries, goals, measurements, water, fasting).
+
+- No MFP username or password is stored or used.
+- The server writes one file, `cookies.json`, into `~/.mfp_mcp/` (or `$MFP_CONFIG_DIR`), with the
+  directory mode `0700` and the file mode `0600`. Treat it as a password.
+- Put `MFP_COOKIES_JSON` in your platform's secrets store, not in a committed file or on a command line.
+- On macOS prefer **Allow** over **Always Allow** at the keychain prompt: "Always" lets that program
+  read the browser's cookie-encryption key from then on. Only `myfitnesspal.com` cookies are read.
+- The only outbound connections are to `myfitnesspal.com` and `api.myfitnesspal.com`.
+- Over stdio the server runs on your machine. In HTTP mode it is reachable from the network and
+  protected only by `MFP_MCP_AUTH_TOKEN`: use HTTPS and a long random token, and treat the token as
+  full read/write access to your diary.
+
+## Troubleshooting
+
+**"No MyFitnessPal session cookies are configured" / "stored session no longer works"**
+No cookies were provided, or MFP no longer accepts them (expired, logged out, password changed).
+1. [Get fresh cookies](#get-your-cookies), then set `MFP_COOKIES_JSON` or, on a remote server, paste at `/session`.
+2. If `cookies.json` holds a dead session and `MFP_COOKIES_JSON` is a good one, the server falls
+   back to the variable automatically. If neither works, delete `~/.mfp_mcp/cookies.json` and import again.
+
+**`export-cookies` says "No MyFitnessPal session found" (macOS)**
+Click **Allow** on the keychain dialog within 2 minutes, and be logged into myfitnesspal.com in that
+browser (try `--browser chrome|arc|...`, or use the paste method).
+
+**Tools not appearing in Claude Desktop**
+1. Check the config is valid JSON and uses absolute paths (no `~`).
+2. Quit and relaunch Claude Desktop completely (Cmd+Q on macOS).
+3. Read the logs: macOS `~/Library/Logs/Claude/`, Windows `%APPDATA%\Claude\logs\`.
+
+**Logging food suddenly fails**
+MFP's internal API is undocumented and can change without notice. That is the most likely cause.
+
+**Empty responses**
+Check that data is logged for that date (format `YYYY-MM-DD`) and try a recent one.
+
+## Development
+
+```bash
+uv sync --python 3.12 --extra dev
+uv run pytest
+uv run black src/ && uv run isort src/ && uv run ruff check src/ && uv run mypy src/
+```
+
+```
+├── Dockerfile              # Container deployment (HTTP server)
+├── pyproject.toml          # Package configuration
+└── src/mfp_mcp/
+    ├── cookie_paste.py     # Parse cookies pasted from DevTools
+    ├── remote.py           # HTTP transport, bearer auth, /session, cookie CLIs
+    └── server.py           # MCP server and tools
+```
 
 ## License
 
