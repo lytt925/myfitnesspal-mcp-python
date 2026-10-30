@@ -243,7 +243,7 @@ def test_import_accepts_export_cookies_output(monkeypatch, capsys):
 @pytest.mark.parametrize("pasted,fragment", [
     ("", "Nothing was pasted"),
     ("{broken", "JSON"),
-    ("_ga=1; other=2", "HttpOnly"),
+    ("_ga=1; other=2", "session-token"),
 ])
 def test_import_rejects_bad_pastes_without_output(monkeypatch, capsys, pasted, fragment):
     code, out, err = run_import(monkeypatch, capsys, pasted)

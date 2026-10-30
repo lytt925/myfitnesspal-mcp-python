@@ -9,9 +9,6 @@ Accepted shapes, detected automatically:
 2. A JSON object ``{"a": "1"}`` (or ``{"cookies": {...}}``, our own format).
 3. A JSON array of ``{"name": ..., "value": ...}`` (cookie-manager extensions).
 4. Rows copied from Application -> Cookies: tab-separated, name then value.
-
-Note: ``document.cookie`` / the Console cannot see HttpOnly cookies, and
-MyFitnessPal's login cookie is HttpOnly, so use one of the sources above.
 """
 
 import json

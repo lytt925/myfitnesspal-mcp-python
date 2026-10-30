@@ -51,13 +51,11 @@ uv run python -m mfp_mcp.server import-cookies cookies.txt
 rm cookies.txt        # it holds your login; don't leave it around
 ```
 
-Don't paste into the terminal itself: a terminal line is limited to 1024 characters and the login
-cookie alone is longer, so the command would just hang. A pipe works too: `pbpaste | uv run python -m
-mfp_mcp.server import-cookies` on macOS.
+A pipe works too: `pbpaste | uv run python -m mfp_mcp.server import-cookies` on macOS.
 
 The file can hold the `cookie:` line, `name=value` lines (the two cookies above are the ones that
-matter), JSON, or a "Copy as cURL" command. Don't use `document.cookie`: the login cookie is
-HttpOnly and won't be there. Never paste cookies into a chat or an issue.
+matter), JSON, or a "Copy as cURL" command. Anything else is rejected. Never paste cookies into
+a chat or an issue.
 
 Either way the session is saved to `~/.mfp_mcp/cookies.json`, which is where the server reads it.
 

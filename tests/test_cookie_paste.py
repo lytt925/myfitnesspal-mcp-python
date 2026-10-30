@@ -81,10 +81,10 @@ def test_rejected_by_mfp_is_not_saved(client, stored, monkeypatch):
     assert not stored.exists()
 
 
-def test_paste_without_login_cookie_explains_httponly(client, stored, monkeypatch):
+def test_paste_without_login_cookie_is_rejected(client, stored, monkeypatch):
     monkeypatch.setattr(remote, "verify_session", lambda c: pytest.fail("must not verify"))
     r = client.post("/session", content="_ga=1; foo=bar", headers=AUTH)
-    assert r.status_code == 400 and "HttpOnly" in r.json()["message"]
+    assert r.status_code == 400 and "session-token" in r.json()["message"]
     assert not stored.exists()
 
 

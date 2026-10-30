@@ -136,8 +136,7 @@ MyFitnessPal before being saved, and are never shown again.</p>
  <li>Open <b>myfitnesspal.com</b> logged in, press <b>F12</b> &rarr; <b>Network</b>, reload.</li>
  <li>Click any request to <code>www.myfitnesspal.com</code> &rarr; <b>Request Headers</b> &rarr;
      copy the whole <code>Cookie</code> value.</li>
- <li>Paste it below. (Application &rarr; Cookies rows and JSON also work.
-     <code>document.cookie</code> will <b>not</b>: the login cookie is HttpOnly.)</li>
+ <li>Paste it below. (Application &rarr; Cookies rows and JSON also work.)</li>
 </ol>
 <textarea id="t" autocomplete="off" spellcheck="false"></textarea><br>
 <button id="b">Save session</button>
@@ -210,8 +209,7 @@ async def save_pasted_session(scope, receive, send) -> None:
     if not server._has_real_mfp_session(cookies):
         await _json_reply(
             send, 400, False,
-            "No login cookie (…session-token) found. It is HttpOnly, so copy it from the "
-            "Network tab's Cookie request header or the Application tab, not document.cookie.",
+            "No login cookie (…session-token) found in the paste.",
         )
         return
     try:
@@ -408,8 +406,7 @@ def import_cookies(path: Optional[str] = None) -> None:
 
         if not server._has_real_mfp_session(cookies):
             raise RuntimeError(
-                "No login cookie (...session-token) in the paste. It is HttpOnly: copy "
-                "the Cookie request header from the Network tab, not document.cookie."
+                "No login cookie (...session-token) found in the paste."
             )
         verify_session(cookies)
         server.save_cookies(cookies)
