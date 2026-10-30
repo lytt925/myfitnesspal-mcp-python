@@ -24,7 +24,6 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar, Cookie
-from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from enum import Enum
@@ -532,6 +531,46 @@ def _cookies_file_age() -> Optional[timedelta]:
         return None
 
 
+def _parse_set_cookie(header: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
+    """Split one Set-Cookie header into (name, value, lower-cased attributes).
+
+    Deliberately not http.cookies.SimpleCookie, which silently drops the whole
+    cookie when an attribute such as Expires has a shape it does not know.
+    """
+    first, *attributes = header.split(";")
+    name, sep, value = first.partition("=")
+    if not sep or not name.strip():
+        return None
+    attrs = {}
+    for attribute in attributes:
+        key, _, val = attribute.strip().partition("=")
+        attrs[key.strip().lower()] = val.strip()
+    return name.strip(), value.strip().strip('"'), attrs
+
+
+def _is_deleted(attrs: Dict[str, str]) -> bool:
+    """True if a Set-Cookie's attributes instruct the client to delete it.
+
+    Max-Age wins over Expires (RFC 6265). An Expires we cannot parse says
+    nothing about deletion, so the cookie is kept rather than the whole
+    refresh being abandoned.
+    """
+    if attrs.get("max-age"):
+        try:
+            return int(attrs["max-age"]) <= 0
+        except ValueError:
+            pass
+    if attrs.get("expires"):
+        try:
+            when = parsedate_to_datetime(attrs["expires"])
+        except (TypeError, ValueError):
+            return False
+        if when.tzinfo is None:  # "-0000" dates parse without a zone; they mean UTC
+            when = when.replace(tzinfo=timezone.utc)
+        return when < datetime.now(timezone.utc)
+    return False
+
+
 def _fetch_refreshed_session(cookies: Dict[str, str]) -> Optional[Dict[str, str]]:
     """Ask MFP to re-issue the session cookies; return the new ones.
 
@@ -552,17 +591,17 @@ def _fetch_refreshed_session(cookies: Dict[str, str]) -> Optional[Dict[str, str]
         return None
     updated: Dict[str, str] = {}
     for header in r.raw.headers.getlist("Set-Cookie"):
-        parsed = SimpleCookie()
-        parsed.load(header)
-        for name, morsel in parsed.items():
-            expires = morsel["expires"]
-            if not morsel.value:
-                continue
-            if expires and parsedate_to_datetime(expires) < datetime.now(timezone.utc):
-                continue
-            updated[name] = morsel.value
-            if "session-token" in name:
-                logger.info(f"MFP session re-issued; expires {expires or 'with browser session'}")
+        parsed = _parse_set_cookie(header)
+        if parsed is None:
+            continue
+        name, value, attrs = parsed
+        if not value or _is_deleted(attrs):
+            continue
+        updated[name] = value
+        if "session-token" in name:
+            logger.info(
+                f"MFP session re-issued; expires {attrs.get('expires') or 'with browser session'}"
+            )
     return updated
 
 
